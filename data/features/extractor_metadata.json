@@ -1,0 +1,20 @@
+{
+  "cnn_model_name": "VGG16",
+  "failed_images": [],
+  "feature_vector_dim": 512,
+  "image_size": [
+    224,
+    224
+  ],
+  "images_dir": "C:\\Users\\Atharva\\OneDrive\\Desktop\\Internship1\\VisionTalk_Image_Captioning\\data\\raw\\Flickr8k_Dataset\\Flicker8k_Dataset",
+  "include_top": false,
+  "limit": null,
+  "num_extracted_this_run": 8091,
+  "num_requested": 8091,
+  "num_reused_from_cache": 0,
+  "num_vectors_on_disk": 8091,
+  "pooling": "avg",
+  "preprocess": "tensorflow.keras.applications.vgg16.preprocess_input",
+  "vector_dir": "C:\\Users\\Atharva\\OneDrive\\Desktop\\Internship1\\VisionTalk_Image_Captioning\\data\\features\\vectors",
+  "weights": "imagenet"
+}

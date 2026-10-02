@@ -1,0 +1,31 @@
+{
+  "dropped_empty_captions": 0,
+  "example_captions": [
+    {
+      "caption": "startseq a child in a pink dress is climbing up a set of stairs in an entry way endseq",
+      "image": "1000268201_693b08cb0e.jpg"
+    },
+    {
+      "caption": "startseq a girl going into a wooden building endseq",
+      "image": "1000268201_693b08cb0e.jpg"
+    },
+    {
+      "caption": "startseq a little girl climbing into a wooden playhouse endseq",
+      "image": "1000268201_693b08cb0e.jpg"
+    }
+  ],
+  "max_caption_length": 37,
+  "num_captions": 40455,
+  "num_images": 8091,
+  "num_test_images": 1000,
+  "num_train_captions": 30000,
+  "num_train_images": 6000,
+  "num_val_images": 1000,
+  "skipped_missing_image": 1,
+  "splits": {
+    "test": 1000,
+    "train": 6000,
+    "val": 1000
+  },
+  "vocab_size": 7593
+}
