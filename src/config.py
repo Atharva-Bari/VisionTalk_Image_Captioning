@@ -75,9 +75,9 @@ MAX_VOCAB_SIZE = None  # None = keep all training words; set e.g. 10000 to cap
 # --- Image / CNN (VGG16 per internship Week 1 requirement) ---
 CNN_MODEL_NAME = "VGG16"
 CNN_WEIGHTS = "imagenet"
-CNN_POOLING = "avg"
+CNN_POOLING = None
 IMAGE_SIZE = (224, 224)
-FEATURE_VECTOR_DIM = 512  # VGG16 global-average-pool output (include_top=False)
+FEATURE_VECTOR_DIM = 4096  # VGG16 fc2 (penultimate) layer output (include_top=True)
 FEATURE_BATCH_SIZE = 16
 
 # --- Training ---

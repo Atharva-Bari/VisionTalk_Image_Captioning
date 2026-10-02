@@ -53,7 +53,7 @@ def expected_extractor_metadata(feature_dim: int) -> dict:
     return {
         "cnn_model_name": CNN_MODEL_NAME,
         "weights": CNN_WEIGHTS,
-        "include_top": False,
+        "include_top": True,
         "pooling": CNN_POOLING,
         "image_size": list(IMAGE_SIZE),
         "preprocess": EXTRACTOR_PREPROCESS,
@@ -64,7 +64,7 @@ def expected_extractor_metadata(feature_dim: int) -> dict:
 def _ensure_metadata_compatible(existing: dict, expected: dict, force: bool) -> None:
     if not existing or force:
         return
-    for key in ("cnn_model_name", "weights", "pooling", "preprocess", "feature_vector_dim"):
+    for key in ("cnn_model_name", "weights", "include_top", "pooling", "preprocess", "feature_vector_dim"):
         if key in existing and existing[key] != expected[key]:
             raise ValueError(
                 f"Cached features used {key}={existing[key]!r}, but config expects "
@@ -78,8 +78,9 @@ def _ensure_metadata_compatible(existing: dict, expected: dict, force: bool) -> 
         )
 
 
-def build_encoder():
-    """Frozen VGG16 without the ImageNet classifier; GAP feature vector."""
+def _build_encoder_variant(variant):
+    """Build one specific VGG16 encoder variant ("fc", "avg", or "max")."""
+    from tensorflow.keras import Model
     from tensorflow.keras.applications.vgg16 import VGG16
 
     if CNN_MODEL_NAME != "VGG16":
@@ -87,14 +88,66 @@ def build_encoder():
             f"Unsupported CNN_MODEL_NAME={CNN_MODEL_NAME!r}. "
             "Update src/config.py or this module."
         )
-    encoder = VGG16(
-        weights=CNN_WEIGHTS,
-        include_top=False,
-        pooling=CNN_POOLING,
-        input_shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3),
-    )
+    if variant == "fc":
+        base = VGG16(
+            weights=CNN_WEIGHTS,
+            include_top=True,
+            input_shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3),
+        )
+        try:
+            output_layer = base.get_layer("fc2")
+        except ValueError:
+            output_layer = base.layers[-2]
+        encoder = Model(inputs=base.input, outputs=output_layer.output,
+                        name="vgg16_fc2_encoder")
+    elif variant in ("avg", "max"):
+        encoder = VGG16(
+            weights=CNN_WEIGHTS,
+            include_top=False,
+            pooling=variant,
+            input_shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3),
+            name=f"vgg16_conv_{variant}_encoder",
+        )
+    else:
+        raise ValueError(f"Unknown encoder variant: {variant!r}")
     encoder.trainable = False
     return encoder
+
+
+def build_encoder():
+    """Frozen VGG16 using the fc2 (penultimate) layer for 4096-dim features."""
+    return _build_encoder_variant("fc")
+
+
+def build_encoder_for_dim(target_feature_dim: int):
+    """Build a VGG16 encoder whose output dimension matches target_feature_dim.
+
+    Tries the default fc2 (4096-D) first, then falls back to global average
+    or max pooling (512-D variants) until the requested dimension is produced.
+    This protects against configuration drift between the training environment
+    and the deployed Streamlit runtime.
+    """
+    target = int(target_feature_dim)
+    ordered_variants = ["fc", "avg", "max"]
+
+    last_error = None
+    for variant in ordered_variants:
+        try:
+            encoder = _build_encoder_variant(variant)
+        except Exception as exc:  # pragma: no cover - defensive
+            last_error = exc
+            continue
+        out_dim = int(encoder.output_shape[-1])
+        if out_dim == target:
+            return encoder
+        del encoder
+
+    try:
+        return build_encoder()
+    except Exception:
+        if last_error is not None:
+            raise last_error
+        raise
 
 
 def _preprocess_batch(images: np.ndarray) -> np.ndarray:
@@ -171,7 +224,7 @@ def extract_features(
         nonlocal encoder, feature_dim, expected_meta
         if encoder is not None:
             return
-        print(f"Loading pretrained {CNN_MODEL_NAME} (include_top=False, pooling={CNN_POOLING})...")
+        print(f"Loading pretrained {CNN_MODEL_NAME} (include_top=True, fc2 layer output)..." )
         encoder = build_encoder()
         feature_dim = int(encoder.output_shape[-1])
         expected_meta = expected_extractor_metadata(feature_dim)

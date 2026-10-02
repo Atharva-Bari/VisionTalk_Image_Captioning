@@ -21,7 +21,7 @@ from src.config import (
     START_TOKEN,
     TOKENIZER_PATH,
 )
-from src.feature_extraction import build_encoder, extract_single_image_feature
+from src.feature_extraction import build_encoder, build_encoder_for_dim, extract_single_image_feature
 from src.tokenizer_utils import load_tokenizer, pad_sequences, sequence_to_text
 from src.utils import strip_sequence_tokens
 
@@ -143,13 +143,17 @@ def generate_caption(
         model, _ = load_caption_model()
     expected_dim = int(model.inputs[0].shape[-1] or FEATURE_VECTOR_DIM)
     if encoder is None:
-        encoder = build_encoder()
+        encoder = build_encoder_for_dim(expected_dim)
     feature = extract_single_image_feature(path, encoder=encoder)
     if feature.shape[-1] != expected_dim:
-        raise ValueError(
-            f"CNN feature size {feature.shape[-1]} does not match model input {expected_dim}. "
-            "Retrain after changing CNN_MODEL_NAME, or extract features with the same encoder."
-        )
+        rebuilt_encoder = build_encoder_for_dim(expected_dim)
+        feature = extract_single_image_feature(path, encoder=rebuilt_encoder)
+        if feature.shape[-1] != expected_dim:
+            raise ValueError(
+                f"CNN feature size {feature.shape[-1]} does not match model input {expected_dim}. "
+                "Retrain after changing CNN_MODEL_NAME, or extract features with the same encoder."
+            )
+        encoder = rebuilt_encoder
     if use_beam:
         caption = beam_search_decode(model, feature, tokenizer, beam_size=beam_size)
     else:

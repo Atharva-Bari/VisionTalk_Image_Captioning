@@ -16,20 +16,30 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.config import FINAL_MODEL_PATH, IMAGE_EXTENSIONS, TOKENIZER_PATH
-from src.feature_extraction import build_encoder
+from src.feature_extraction import build_encoder, build_encoder_for_dim
 from src.inference import generate_caption, resolve_model_path
 from src.tokenizer_utils import load_tokenizer
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Loading model and encoder…")
 def load_runtime():
     model_path = resolve_model_path()
     from tensorflow.keras.models import load_model
 
     model = load_model(model_path)
     tokenizer = load_tokenizer(TOKENIZER_PATH)
-    encoder = build_encoder()
-    return model, tokenizer, encoder, model_path
+    expected_dim = int(model.inputs[0].shape[-1])
+    encoder = build_encoder_for_dim(expected_dim)
+
+    actual_dim = int(encoder.output_shape[-1])
+    if actual_dim != expected_dim:
+        st.cache_resource.clear()
+        raise ValueError(
+            f"Dimension mismatch detected and cache cleared. "
+            f"Encoder={actual_dim}, Model={expected_dim}. "
+            "Please refresh the page or restart the Streamlit server once."
+        )
+    return model, tokenizer, encoder, model_path, expected_dim
 
 
 def main() -> None:
@@ -51,12 +61,30 @@ def main() -> None:
         return
 
     try:
-        model, tokenizer, encoder, model_path = load_runtime()
+        model, tokenizer, encoder, model_path, expected_dim = load_runtime()
     except (OSError, ValueError, FileNotFoundError) as exc:
         st.error(f"Could not load the captioning runtime: {exc}")
+        if "Dimension mismatch" in str(exc):
+            st.info("🔄 Press R or click 'Rerun' in the top-right to reload with the new encoder.")
         return
 
-    st.success(f"Loaded model: {model_path.name}")
+    with st.sidebar:
+        st.header("Runtime")
+        st.info(f"Model: `{model_path.name}`")
+        encoder_dim = int(encoder.output_shape[-1])
+        st.metric("Feature dim (encoder)", encoder_dim)
+        st.metric("Feature dim (model)", expected_dim)
+        if st.button("🔁 Clear cached model/encoder"):
+            st.cache_resource.clear()
+            st.success("Cache cleared. Rerun the page (press R).")
+            st.stop()
+
+    if encoder_dim == expected_dim:
+        st.success(f"Loaded model: {model_path.name}  ·  features={encoder_dim}D")
+    else:
+        st.warning(f"Encoder dim {encoder_dim} ≠ model dim {expected_dim}. Clearing cache…")
+        st.cache_resource.clear()
+        st.stop()
     uploaded = st.file_uploader(
         "Upload an image",
         type=[ext.lstrip(".") for ext in sorted(IMAGE_EXTENSIONS)],
