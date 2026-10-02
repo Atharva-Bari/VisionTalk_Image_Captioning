@@ -79,6 +79,17 @@ def main() -> None:
             st.success("Cache cleared. Rerun the page (press R).")
             st.stop()
 
+        st.divider()
+        st.header("Decoding")
+        use_beam = st.toggle("Use beam search (recommended)", value=True,
+                             help="Beam search explores multiple caption candidates and usually avoids the repetition loops that plague greedy decoding.")
+        beam_size = st.slider("Beam size", min_value=2, max_value=7, value=3, step=1,
+                              disabled=not use_beam)
+        if use_beam:
+            st.caption(f"Beam size {beam_size} · higher = more candidates, slower")
+        else:
+            st.caption("Greedy decoding · fastest but can still degenerate with very short captions")
+
     if encoder_dim == expected_dim:
         st.success(f"Loaded model: {model_path.name}  ·  features={encoder_dim}D")
     else:
@@ -106,19 +117,23 @@ def main() -> None:
         temp_path = ROOT / "outputs" / "predictions" / "_upload.jpg"
         temp_path.parent.mkdir(parents=True, exist_ok=True)
         image.save(temp_path, format="JPEG")
-        with st.spinner("Generating caption..."):
+        decoder_label = f"beam search (k={beam_size})" if use_beam else "greedy"
+        with st.spinner(f"Generating caption with {decoder_label}..."):
             try:
                 caption = generate_caption(
                     temp_path,
                     model=model,
                     tokenizer=tokenizer,
                     encoder=encoder,
+                    use_beam=use_beam,
+                    beam_size=beam_size,
                 )
             except (FileNotFoundError, ValueError, RuntimeError) as exc:
                 st.error(str(exc))
                 return
         st.subheader("Generated caption")
-        st.write(caption)
+        st.markdown(f"> {caption}")
+        st.caption(f"Decoder: {decoder_label}")
 
 
 if __name__ == "__main__":

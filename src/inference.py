@@ -56,24 +56,56 @@ def _special_ids(tokenizer: dict) -> tuple[int, int]:
     return start_id, end_id
 
 
+def _suppress_repetitions(probs, seq, block_size: int = 3, penalty: float = 1e-9) -> np.ndarray:
+    """Suppress tokens that would create obvious n-gram repetitions in greedy decode.
+
+    Also zeros out tokens that were already output in the last `block_size` positions,
+    which prevents the "behind behind behind..." infinite loop common to
+    under-trained or ReLU-collapsed LSTM captioners.
+    """
+    probs = np.asarray(probs, dtype=np.float64)
+    recent = seq[-block_size:] if len(seq) >= block_size else seq
+    for tok in recent:
+        if tok >= len(probs):
+            continue
+        probs[tok] *= penalty
+    return probs
+
+
+def _break_repetition_loop(seq: list[int], min_run: int = 3) -> bool:
+    """Return True if the tail of `seq` repeats the same token `min_run` times in a row."""
+    if len(seq) < min_run + 1:
+        return False
+    tail = seq[-min_run:]
+    return all(t == tail[0] and tail[0] != 0 for t in tail)
+
+
 def greedy_decode(
     model,
     image_feature: np.ndarray,
     tokenizer: dict,
     max_length: int | None = None,
 ) -> str:
-    """Predict the next word until endseq or max_length."""
+    """Predict the next word until endseq, max_length, or a repetition loop is detected.
+
+    Adds a lightweight repetition suppressor so the same word can't dominate the
+    output.  If the model enters a tight repetition loop (e.g. "behind behind behind")
+    we stop early rather than keep dumping the same token.
+    """
     start_id, end_id = _special_ids(tokenizer)
     max_length = int(max_length or tokenizer.get("max_caption_length") or 20)
     feature = np.asarray(image_feature, dtype=np.float32).reshape(1, -1)
     token_ids = [start_id]
     for _ in range(max_length):
         padded = pad_sequences([token_ids], max_length)
-        probs = model.predict([feature, padded], verbose=0)[0]
+        raw_probs = model.predict([feature, padded], verbose=0)[0]
+        probs = _suppress_repetitions(raw_probs, token_ids[1:], block_size=4, penalty=1e-10)
         next_id = int(np.argmax(probs))
         if next_id == end_id or next_id == 0:
             break
         token_ids.append(next_id)
+        if _break_repetition_loop(token_ids[1:], min_run=3):
+            break
         if len(token_ids) >= max_length:
             break
     return sequence_to_text(token_ids, tokenizer, strip_special=True)
@@ -86,7 +118,14 @@ def beam_search_decode(
     beam_size: int = BEAM_SIZE,
     max_length: int | None = None,
 ) -> str:
-    """Optional beam search. Greedy decoding is the default inference path."""
+    """Beam search with repetition penalty and length normalization.
+
+    For each candidate beam we down-rank tokens that would cause an immediate
+    repetition of the previous word (prevents the "behind behind behind" degenerate
+    output) and apply a hard break for any beam that enters a 3-token repetition
+    loop.  Length normalization is already applied in the final sort, so short
+    valid captions can beat padded or degenerate long ones.
+    """
     start_id, end_id = _special_ids(tokenizer)
     max_length = int(max_length or tokenizer.get("max_caption_length") or 20)
     feature = np.asarray(image_feature, dtype=np.float32).reshape(1, -1)
@@ -99,14 +138,19 @@ def beam_search_decode(
             if done:
                 completed.append((score, seq))
                 continue
+            if _break_repetition_loop(seq[1:], min_run=3):
+                completed.append((score, seq))
+                continue
             padded = pad_sequences([seq], max_length)
-            probs = model.predict([feature, padded], verbose=0)[0]
+            raw_probs = model.predict([feature, padded], verbose=0)[0]
+            probs = _suppress_repetitions(raw_probs, seq[1:], block_size=3, penalty=1e-8)
             top_ids = np.argsort(probs)[-beam_size:]
             for token_id in top_ids:
                 token_id = int(token_id)
                 logp = float(np.log(max(probs[token_id], 1e-12)))
                 new_seq = seq + [token_id]
-                finished = token_id == end_id or token_id == 0
+                finished = (token_id == end_id or token_id == 0 or
+                            _break_repetition_loop(new_seq[1:], min_run=3))
                 expanded.append((score + logp, new_seq, finished))
         if not expanded:
             break
