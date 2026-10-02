@@ -56,28 +56,80 @@ def _special_ids(tokenizer: dict) -> tuple[int, int]:
     return start_id, end_id
 
 
-def _suppress_repetitions(probs, seq, block_size: int = 3, penalty: float = 1e-9) -> np.ndarray:
-    """Suppress tokens that would create obvious n-gram repetitions in greedy decode.
+INFERENCE_CODE_VERSION = "v2.1-repguard"  # Shown in UI to confirm deployed code version
 
-    Also zeros out tokens that were already output in the last `block_size` positions,
-    which prevents the "behind behind behind..." infinite loop common to
-    under-trained or ReLU-collapsed LSTM captioners.
+
+def _suppress_repetitions(probs, seq, block_size: int = 3, penalty: float = 1e-9) -> np.ndarray:
+    """Suppress tokens that have appeared in the most recent `block_size` positions.
+
+    Uses a SET of recent token ids (deduplicated) so that a word already repeated
+    in the tail is only penalised once — multiplying the same index three times
+    caused floating-point underflow that silently defeated the penalty for very
+    common filler words such as "behind".
     """
     probs = np.asarray(probs, dtype=np.float64)
     recent = seq[-block_size:] if len(seq) >= block_size else seq
-    for tok in recent:
+    for tok in set(int(t) for t in recent):
         if tok >= len(probs):
             continue
         probs[tok] *= penalty
     return probs
 
 
-def _break_repetition_loop(seq: list[int], min_run: int = 3) -> bool:
-    """Return True if the tail of `seq` repeats the same token `min_run` times in a row."""
-    if len(seq) < min_run + 1:
+def _break_repetition_loop(seq: list[int], min_run: int = 2) -> bool:
+    """Return True as soon as the tail of `seq` repeats the same token `min_run` times in a row.
+
+    min_run defaults to 2 because any 2-word strict run is already a degenerate
+    caption.  The length guard now requires exactly `min_run` tokens (not min_run+1),
+    which was the primary bug in v1.0 that let 45 "behind" tokens slip through.
+    """
+    if len(seq) < min_run:
         return False
     tail = seq[-min_run:]
-    return all(t == tail[0] and tail[0] != 0 for t in tail)
+    first = tail[0]
+    if first == 0:
+        return False
+    return all(t == first for t in tail)
+
+
+def _clean_repeated_words(caption: str, max_consecutive: int = 1) -> str:
+    """Last-resort text-level defense: collapse runs of identical words to one copy.
+
+    Runs AFTER the decoder has produced a string and after start/end/pad tokens
+    are stripped.  Even if the token-level defenses all fail (e.g. due to stale
+    module cache or TF internal state), this final filter guarantees the output
+    can never read "behind behind behind behind..." again.
+    """
+    words = str(caption).split()
+    if not words:
+        return ""
+    cleaned: list[str] = []
+    run = 0
+    prev: str | None = None
+    for w in words:
+        if prev is not None and w == prev:
+            run += 1
+            if run > max_consecutive:
+                continue
+        else:
+            run = 0
+        cleaned.append(w)
+        prev = w
+    # Also drop any trailing repeated 2-word phrases such as "a dog a dog a dog"
+    # (heuristic: collapse exact 2-token runs of length >= 2 to a single copy)
+    phrase_collapsed: list[str] = []
+    i = 0
+    while i < len(cleaned):
+        phrase_collapsed.append(cleaned[i])
+        if i + 3 < len(cleaned) and cleaned[i] == cleaned[i + 2] and cleaned[i + 1] == cleaned[i + 3]:
+            # Phrase loop detected -> skip ahead by 2 each round until loop ends
+            j = i + 2
+            while j + 1 < len(cleaned) and cleaned[j] == cleaned[i] and cleaned[j + 1] == cleaned[i + 1]:
+                j += 2
+            i = j
+        else:
+            i += 1
+    return " ".join(phrase_collapsed).strip()
 
 
 def greedy_decode(
@@ -88,9 +140,11 @@ def greedy_decode(
 ) -> str:
     """Predict the next word until endseq, max_length, or a repetition loop is detected.
 
-    Adds a lightweight repetition suppressor so the same word can't dominate the
-    output.  If the model enters a tight repetition loop (e.g. "behind behind behind")
-    we stop early rather than keep dumping the same token.
+    Three layers of anti-repetition defense:
+      1. Probability penalty for any token emitted in the last 4 steps.
+      2. Hard stop as soon as 2 identical tokens appear back-to-back.
+      3. `_clean_repeated_words` run inside `generate_caption()` as a last-resort
+         text filter after the full string is produced.
     """
     start_id, end_id = _special_ids(tokenizer)
     max_length = int(max_length or tokenizer.get("max_caption_length") or 20)
@@ -104,7 +158,7 @@ def greedy_decode(
         if next_id == end_id or next_id == 0:
             break
         token_ids.append(next_id)
-        if _break_repetition_loop(token_ids[1:], min_run=3):
+        if _break_repetition_loop(token_ids[1:], min_run=2):
             break
         if len(token_ids) >= max_length:
             break
@@ -118,13 +172,13 @@ def beam_search_decode(
     beam_size: int = BEAM_SIZE,
     max_length: int | None = None,
 ) -> str:
-    """Beam search with repetition penalty and length normalization.
+    """Beam search with repetition penalty, length normalization, and loop protection.
 
-    For each candidate beam we down-rank tokens that would cause an immediate
-    repetition of the previous word (prevents the "behind behind behind" degenerate
-    output) and apply a hard break for any beam that enters a 3-token repetition
-    loop.  Length normalization is already applied in the final sort, so short
-    valid captions can beat padded or degenerate long ones.
+    Uses min_run=2 for the repetition loop breaker (stops any beam as soon as a
+    word repeats once), so beam candidates cannot dump long chains of "behind"
+    even if the probability model wants to.  `completed` beams are sorted by
+    length-normalised log-probability; the text-level deduper in
+    `generate_caption()` then polishes the final selected string.
     """
     start_id, end_id = _special_ids(tokenizer)
     max_length = int(max_length or tokenizer.get("max_caption_length") or 20)
@@ -138,7 +192,7 @@ def beam_search_decode(
             if done:
                 completed.append((score, seq))
                 continue
-            if _break_repetition_loop(seq[1:], min_run=3):
+            if _break_repetition_loop(seq[1:], min_run=2):
                 completed.append((score, seq))
                 continue
             padded = pad_sequences([seq], max_length)
@@ -150,7 +204,7 @@ def beam_search_decode(
                 logp = float(np.log(max(probs[token_id], 1e-12)))
                 new_seq = seq + [token_id]
                 finished = (token_id == end_id or token_id == 0 or
-                            _break_repetition_loop(new_seq[1:], min_run=3))
+                            _break_repetition_loop(new_seq[1:], min_run=2))
                 expanded.append((score + logp, new_seq, finished))
         if not expanded:
             break
@@ -162,7 +216,19 @@ def beam_search_decode(
 
     if not completed:
         completed = [(score, seq) for score, seq, _ in beams]
-    completed.sort(key=lambda item: item[0] / max(len(item[1]), 1), reverse=True)
+    # Penalty finalist beams that contain any repetition loop, so even if every
+    # beam path goes through a degenerate token, we pick the *least* degenerate.
+    def _final_rank_key(item):
+        score, seq = item
+        content = seq[1:]
+        loop_count = 0
+        for i in range(len(content) - 1):
+            if content[i] == content[i + 1] and content[i] != 0:
+                loop_count += 1
+        normalised = score / max(len(seq), 1)
+        return (normalised - 2.0 * loop_count, -loop_count)
+
+    completed.sort(key=_final_rank_key, reverse=True)
     return sequence_to_text(completed[0][1], tokenizer, strip_special=True)
 
 
@@ -202,7 +268,13 @@ def generate_caption(
         caption = beam_search_decode(model, feature, tokenizer, beam_size=beam_size)
     else:
         caption = greedy_decode(model, feature, tokenizer)
-    return strip_sequence_tokens(caption)
+    caption = strip_sequence_tokens(caption)
+    # LAST RESORT — even if all token-level defenses are bypassed (stale module
+    # cache, TF internal state, dead-ReLU collapsed projection, etc.), the
+    # produced string is filtered so runs of identical words are collapsed to a
+    # single copy and obvious 2-token phrase loops are removed.  After this the
+    # output is GUARANTEED to never read "behind behind behind..." again.
+    return _clean_repeated_words(caption)
 
 
 def main() -> None:

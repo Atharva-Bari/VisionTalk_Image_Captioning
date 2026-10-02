@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
 
 from src.config import FINAL_MODEL_PATH, IMAGE_EXTENSIONS, TOKENIZER_PATH
 from src.feature_extraction import build_encoder, build_encoder_for_dim
-from src.inference import generate_caption, resolve_model_path
+from src.inference import INFERENCE_CODE_VERSION, generate_caption, resolve_model_path
 from src.tokenizer_utils import load_tokenizer
 
 
@@ -89,6 +89,18 @@ def main() -> None:
             st.caption(f"Beam size {beam_size} · higher = more candidates, slower")
         else:
             st.caption("Greedy decoding · fastest but can still degenerate with very short captions")
+
+        st.divider()
+        st.header("About")
+        st.caption(f"Inference code: `{INFERENCE_CODE_VERSION}`")
+        with st.expander("Seeing 'behind behind behind'?"):
+            st.markdown(
+                "If the caption is still a repetition loop, the deployed server may "
+                "still be holding the OLD `src.inference` module cached in "
+                "`sys.modules` (Streamlit 'Rerun' won't clear that).\n\n"
+                "**Fix:** click the app menu ⋯ → **Reboot app**, then try again. "
+                "After reboot, the sidebar shows inference code `v2.1-repguard`."
+            )
 
     if encoder_dim == expected_dim:
         st.success(f"Loaded model: {model_path.name}  ·  features={encoder_dim}D")
