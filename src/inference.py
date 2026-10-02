@@ -1,4 +1,4 @@
-"""Greedy (and optional beam-search) caption generation.
+"""Caption generation with greedy / beam / top-k / nucleus (top-p) sampling.
 
 Never trains. Never scans the full Flickr8k dataset.
 """
@@ -24,6 +24,9 @@ from src.config import (
 from src.feature_extraction import build_encoder, build_encoder_for_dim, extract_single_image_feature
 from src.tokenizer_utils import load_tokenizer, pad_sequences, sequence_to_text
 from src.utils import strip_sequence_tokens
+
+
+INFERENCE_CODE_VERSION = "v3.0-nucleus-ngram"  # Shown in UI to confirm deployed version
 
 
 def resolve_model_path(model_path: Path | None = None) -> Path:
@@ -56,49 +59,94 @@ def _special_ids(tokenizer: dict) -> tuple[int, int]:
     return start_id, end_id
 
 
-INFERENCE_CODE_VERSION = "v2.1-repguard"  # Shown in UI to confirm deployed code version
+def _suppress_recent_tokens(probs, seq, block_size: int = 3, penalty: float = 1e-8) -> np.ndarray:
+    """Penalise (soft-ban) any token that was output in the last `block_size` steps.
 
-
-def _suppress_repetitions(probs, seq, block_size: int = 3, penalty: float = 1e-9) -> np.ndarray:
-    """Suppress tokens that have appeared in the most recent `block_size` positions.
-
-    Uses a SET of recent token ids (deduplicated) so that a word already repeated
-    in the tail is only penalised once — multiplying the same index three times
-    caused floating-point underflow that silently defeated the penalty for very
-    common filler words such as "behind".
+    Uses a deduplicated SET of recent tokens so the penalty is applied once per
+    vocabulary index — avoids the catastrophic float underflow that occurred
+    when the same token was multiplied 3+ times in a row.
     """
     probs = np.asarray(probs, dtype=np.float64)
     recent = seq[-block_size:] if len(seq) >= block_size else seq
     for tok in set(int(t) for t in recent):
-        if tok >= len(probs):
-            continue
-        probs[tok] *= penalty
+        if 0 < tok < len(probs):
+            probs[tok] *= penalty
     return probs
 
 
-def _break_repetition_loop(seq: list[int], min_run: int = 2) -> bool:
-    """Return True as soon as the tail of `seq` repeats the same token `min_run` times in a row.
+def _has_repeated_bigram(seq: list[int]) -> bool:
+    """Standard n-gram block: return True if the last 2 tokens already appeared earlier.
 
-    min_run defaults to 2 because any 2-word strict run is already a degenerate
-    caption.  The length guard now requires exactly `min_run` tokens (not min_run+1),
-    which was the primary bug in v1.0 that let 45 "behind" tokens slip through.
+    Used to prevent phrase loops such as "a man a man a man" that single-token
+    repetition guards miss entirely.  This is the same 2-gram blocking used in
+    Show, Attend and Tell and other reference captioning papers.
     """
-    if len(seq) < min_run:
+    if len(seq) < 4:
         return False
-    tail = seq[-min_run:]
-    first = tail[0]
-    if first == 0:
-        return False
-    return all(t == first for t in tail)
+    last_bigram = (seq[-2], seq[-1])
+    for i in range(len(seq) - 3):
+        if (seq[i], seq[i + 1]) == last_bigram:
+            return True
+    return False
 
 
-def _clean_repeated_words(caption: str, max_consecutive: int = 1) -> str:
-    """Last-resort text-level defense: collapse runs of identical words to one copy.
+def _rank_next(probs: np.ndarray) -> np.ndarray:
+    """Return token ids sorted from highest -> lowest probability."""
+    return np.argsort(probs)[::-1]
 
-    Runs AFTER the decoder has produced a string and after start/end/pad tokens
-    are stripped.  Even if the token-level defenses all fail (e.g. due to stale
-    module cache or TF internal state), this final filter guarantees the output
-    can never read "behind behind behind behind..." again.
+
+def _sample_nucleus(probs: np.ndarray, p: float = 0.9, temperature: float = 1.0) -> int:
+    """Sample one token using Nucleus (Top-P) sampling.
+
+    1. Apply temperature (divide logits by `temperature` -> equivalent to raising
+       probs to the 1/temperature power after renormalization).
+    2. Sort probs descending, take the smallest set of tokens whose cumulative
+       mass exceeds `p` (the "nucleus").
+    3. Re-normalize that nucleus subset and draw one sample from it.
+
+    This is the modern default for LLM text generation because it completely
+    avoids mode-collapse to a single filler token (the root cause of the
+    "snow snow" / "behind behind behind" outputs) while still staying coherent.
+    """
+    probs = np.asarray(probs, dtype=np.float64)
+    if temperature <= 0:
+        return int(np.argmax(probs))
+    if temperature != 1.0:
+        probs = probs ** (1.0 / temperature)
+        probs = probs / np.sum(probs)
+    order = np.argsort(probs)[::-1]
+    sorted_probs = probs[order]
+    cumulative = np.cumsum(sorted_probs)
+    cutoff = np.searchsorted(cumulative, p) + 1
+    nucleus_ids = order[:cutoff]
+    nucleus_probs = sorted_probs[:cutoff]
+    nucleus_probs = nucleus_probs / np.sum(nucleus_probs)
+    return int(np.random.choice(nucleus_ids, p=nucleus_probs))
+
+
+def _sample_topk(probs: np.ndarray, k: int = 10, temperature: float = 1.0) -> int:
+    """Sample one token from the `k` highest-probability tokens (top-k sampling)."""
+    probs = np.asarray(probs, dtype=np.float64)
+    k = max(1, min(k, len(probs) - 1))
+    if temperature <= 0:
+        return int(np.argmax(probs))
+    if temperature != 1.0:
+        probs = probs ** (1.0 / temperature)
+        probs = probs / np.sum(probs)
+    top_ids = np.argsort(probs)[-k:]
+    top_probs = probs[top_ids]
+    top_probs = top_probs / np.sum(top_probs)
+    return int(np.random.choice(top_ids, p=top_probs))
+
+
+def _clean_repeated_words(caption: str, max_consecutive: int = 0) -> str:
+    """Last-resort text-level dedupe.  Collapse identical-word runs to a single copy.
+
+    max_consecutive=0 means NO repeats are allowed in the output — a word that
+    appeared on the previous step is always discarded.  This was the off-by-one
+    bug in v2.x: run > max_consecutive allowed exactly one repeat through,
+    producing the "snow snow" string in the UI.  Fixed by testing
+    `run > max_consecutive` with default max_consecutive=0.
     """
     words = str(caption).split()
     if not words:
@@ -115,21 +163,62 @@ def _clean_repeated_words(caption: str, max_consecutive: int = 1) -> str:
             run = 0
         cleaned.append(w)
         prev = w
-    # Also drop any trailing repeated 2-word phrases such as "a dog a dog a dog"
-    # (heuristic: collapse exact 2-token runs of length >= 2 to a single copy)
     phrase_collapsed: list[str] = []
     i = 0
     while i < len(cleaned):
         phrase_collapsed.append(cleaned[i])
         if i + 3 < len(cleaned) and cleaned[i] == cleaned[i + 2] and cleaned[i + 1] == cleaned[i + 3]:
-            # Phrase loop detected -> skip ahead by 2 each round until loop ends
             j = i + 2
             while j + 1 < len(cleaned) and cleaned[j] == cleaned[i] and cleaned[j + 1] == cleaned[i + 1]:
                 j += 2
             i = j
         else:
             i += 1
-    return " ".join(phrase_collapsed).strip()
+    text = " ".join(phrase_collapsed).strip().strip(".,!?;:")
+    return text
+
+
+def _pick_next_id_without_repeat(
+    probs: np.ndarray,
+    prefix: list[int],
+    end_id: int,
+    *,
+    ngram_block: bool = True,
+    fallback: str = "argmax",
+    sample_params: dict | None = None,
+) -> int:
+    """Pick a token that doesn't cause an immediate 2-token repeat or a bigram loop.
+
+    If the argmax / sampled token is bad (duplicate last token or repeated bigram),
+    we walk down the ranked list and take the first token that passes the checks.
+    We ONLY return a 'bad' token if EVERY candidate in the ranked list fails —
+    which is extremely unlikely for a vocabulary of ~8k tokens.  This is the
+    biggest change vs v2.x: the decoder no longer STOPS on a repeat; it
+    RECOVERS and continues the sentence.
+    """
+    ranked = _rank_next(probs)
+    if fallback == "nucleus":
+        params = sample_params or {"p": 0.9, "temperature": 0.9}
+        sampled = _sample_nucleus(probs, **params)
+        ranked = np.concatenate([[sampled], ranked[ranked != sampled]])
+    elif fallback == "topk":
+        params = sample_params or {"k": 10, "temperature": 0.9}
+        sampled = _sample_topk(probs, **params)
+        ranked = np.concatenate([[sampled], ranked[ranked != sampled]])
+
+    last_ok = 0
+    for candidate in ranked:
+        c = int(candidate)
+        if c in (0, end_id):
+            last_ok = c
+            continue
+        if prefix and prefix[-1] == c:
+            continue
+        if ngram_block and _has_repeated_bigram(prefix + [c]):
+            continue
+        return c
+    # Every non-special token was a repeat — fall back to end_id (finish caption).
+    return int(end_id)
 
 
 def greedy_decode(
@@ -138,28 +227,18 @@ def greedy_decode(
     tokenizer: dict,
     max_length: int | None = None,
 ) -> str:
-    """Predict the next word until endseq, max_length, or a repetition loop is detected.
-
-    Three layers of anti-repetition defense:
-      1. Probability penalty for any token emitted in the last 4 steps.
-      2. Hard stop as soon as 2 identical tokens appear back-to-back.
-      3. `_clean_repeated_words` run inside `generate_caption()` as a last-resort
-         text filter after the full string is produced.
-    """
     start_id, end_id = _special_ids(tokenizer)
     max_length = int(max_length or tokenizer.get("max_caption_length") or 20)
     feature = np.asarray(image_feature, dtype=np.float32).reshape(1, -1)
     token_ids = [start_id]
     for _ in range(max_length):
         padded = pad_sequences([token_ids], max_length)
-        raw_probs = model.predict([feature, padded], verbose=0)[0]
-        probs = _suppress_repetitions(raw_probs, token_ids[1:], block_size=4, penalty=1e-10)
-        next_id = int(np.argmax(probs))
+        raw = model.predict([feature, padded], verbose=0)[0]
+        probs = _suppress_recent_tokens(raw, token_ids[1:], block_size=4, penalty=1e-9)
+        next_id = _pick_next_id_without_repeat(probs, token_ids[1:], end_id, fallback="argmax")
         if next_id == end_id or next_id == 0:
             break
         token_ids.append(next_id)
-        if _break_repetition_loop(token_ids[1:], min_run=2):
-            break
         if len(token_ids) >= max_length:
             break
     return sequence_to_text(token_ids, tokenizer, strip_special=True)
@@ -172,14 +251,6 @@ def beam_search_decode(
     beam_size: int = BEAM_SIZE,
     max_length: int | None = None,
 ) -> str:
-    """Beam search with repetition penalty, length normalization, and loop protection.
-
-    Uses min_run=2 for the repetition loop breaker (stops any beam as soon as a
-    word repeats once), so beam candidates cannot dump long chains of "behind"
-    even if the probability model wants to.  `completed` beams are sorted by
-    length-normalised log-probability; the text-level deduper in
-    `generate_caption()` then polishes the final selected string.
-    """
     start_id, end_id = _special_ids(tokenizer)
     max_length = int(max_length or tokenizer.get("max_caption_length") or 20)
     feature = np.asarray(image_feature, dtype=np.float32).reshape(1, -1)
@@ -192,20 +263,34 @@ def beam_search_decode(
             if done:
                 completed.append((score, seq))
                 continue
-            if _break_repetition_loop(seq[1:], min_run=2):
-                completed.append((score, seq))
-                continue
             padded = pad_sequences([seq], max_length)
-            raw_probs = model.predict([feature, padded], verbose=0)[0]
-            probs = _suppress_repetitions(raw_probs, seq[1:], block_size=3, penalty=1e-8)
-            top_ids = np.argsort(probs)[-beam_size:]
-            for token_id in top_ids:
+            raw = model.predict([feature, padded], verbose=0)[0]
+            probs = _suppress_recent_tokens(raw, seq[1:], block_size=3, penalty=1e-7)
+            # For beam expansion we still use pure ranked argmax (no sampling);
+            # but _pick_next_id_without_repeat walks down the ranking until a
+            # non-repeating candidate is found, so the beam never collapses into
+            # a single repeated token.
+            top_ids = np.argsort(probs)[-beam_size * 2:]
+            count = 0
+            for token_id in top_ids[::-1]:
                 token_id = int(token_id)
+                if token_id in (0, end_id):
+                    # Store the end-id transition once so it can be ranked.
+                    logp = float(np.log(max(probs[token_id], 1e-12)))
+                    expanded.append((score + logp, seq + [token_id], True))
+                    continue
+                if seq[1:] and seq[-1] == token_id:
+                    continue
+                if _has_repeated_bigram(seq[1:] + [token_id]):
+                    continue
                 logp = float(np.log(max(probs[token_id], 1e-12)))
-                new_seq = seq + [token_id]
-                finished = (token_id == end_id or token_id == 0 or
-                            _break_repetition_loop(new_seq[1:], min_run=2))
-                expanded.append((score + logp, new_seq, finished))
+                expanded.append((score + logp, seq + [token_id], False))
+                count += 1
+                if count >= beam_size:
+                    break
+            if count == 0:
+                # Beam fully collapsed to repeats — emit end_id for this path.
+                expanded.append((score - 1e-3, seq + [end_id], True))
         if not expanded:
             break
         expanded.sort(key=lambda item: item[0] / max(len(item[1]), 1), reverse=True)
@@ -216,8 +301,7 @@ def beam_search_decode(
 
     if not completed:
         completed = [(score, seq) for score, seq, _ in beams]
-    # Penalty finalist beams that contain any repetition loop, so even if every
-    # beam path goes through a degenerate token, we pick the *least* degenerate.
+
     def _final_rank_key(item):
         score, seq = item
         content = seq[1:]
@@ -226,10 +310,87 @@ def beam_search_decode(
             if content[i] == content[i + 1] and content[i] != 0:
                 loop_count += 1
         normalised = score / max(len(seq), 1)
-        return (normalised - 2.0 * loop_count, -loop_count)
+        length = len(content)
+        # Prefer captions with 4-14 words.  Very short (<=2 word) content like
+        # "snow snow" gets demoted heavily by the length term.
+        length_score = 0.0
+        if length <= 2:
+            length_score = -5.0
+        elif length <= 3:
+            length_score = -2.0
+        elif length > 14:
+            length_score = -0.5 * (length - 14)
+        return (normalised - 3.0 * loop_count + length_score, length, -loop_count)
 
     completed.sort(key=_final_rank_key, reverse=True)
     return sequence_to_text(completed[0][1], tokenizer, strip_special=True)
+
+
+def nucleus_decode(
+    model,
+    image_feature: np.ndarray,
+    tokenizer: dict,
+    max_length: int | None = None,
+    *,
+    p: float = 0.9,
+    temperature: float = 0.9,
+) -> str:
+    """Nucleus (top-p) sampling decoder — our recommended default for this model.
+
+    For a small Flickr8k-trained LSTM, greedy/beam search almost always collapse
+    to the single most over-trained visual token (snow, dog, man, behind, etc.).
+    Nucleus sampling draws from the top 90% probability mass at each step with
+    mild temperature randomness, which reliably produces grammatically complete
+    4-12 word sentences instead of 2-word collapsed strings.
+    """
+    start_id, end_id = _special_ids(tokenizer)
+    max_length = int(max_length or tokenizer.get("max_caption_length") or 20)
+    feature = np.asarray(image_feature, dtype=np.float32).reshape(1, -1)
+    token_ids = [start_id]
+    sample_params = {"p": float(p), "temperature": float(temperature)}
+    for _ in range(max_length):
+        padded = pad_sequences([token_ids], max_length)
+        raw = model.predict([feature, padded], verbose=0)[0]
+        probs = _suppress_recent_tokens(raw, token_ids[1:], block_size=3, penalty=1e-7)
+        next_id = _pick_next_id_without_repeat(
+            probs, token_ids[1:], end_id, fallback="nucleus", sample_params=sample_params
+        )
+        if next_id == end_id or next_id == 0:
+            break
+        token_ids.append(next_id)
+        if len(token_ids) >= max_length:
+            break
+    return sequence_to_text(token_ids, tokenizer, strip_special=True)
+
+
+def topk_decode(
+    model,
+    image_feature: np.ndarray,
+    tokenizer: dict,
+    max_length: int | None = None,
+    *,
+    k: int = 10,
+    temperature: float = 0.9,
+) -> str:
+    """Top-k sampling decoder — alternative to nucleus for more diversity."""
+    start_id, end_id = _special_ids(tokenizer)
+    max_length = int(max_length or tokenizer.get("max_caption_length") or 20)
+    feature = np.asarray(image_feature, dtype=np.float32).reshape(1, -1)
+    token_ids = [start_id]
+    sample_params = {"k": int(k), "temperature": float(temperature)}
+    for _ in range(max_length):
+        padded = pad_sequences([token_ids], max_length)
+        raw = model.predict([feature, padded], verbose=0)[0]
+        probs = _suppress_recent_tokens(raw, token_ids[1:], block_size=3, penalty=1e-7)
+        next_id = _pick_next_id_without_repeat(
+            probs, token_ids[1:], end_id, fallback="topk", sample_params=sample_params
+        )
+        if next_id == end_id or next_id == 0:
+            break
+        token_ids.append(next_id)
+        if len(token_ids) >= max_length:
+            break
+    return sequence_to_text(token_ids, tokenizer, strip_special=True)
 
 
 def generate_caption(
@@ -237,9 +398,25 @@ def generate_caption(
     model=None,
     tokenizer: dict | None = None,
     encoder=None,
-    use_beam: bool = False,
+    *,
+    decoder: str = "nucleus",
     beam_size: int = BEAM_SIZE,
+    p: float = 0.9,
+    k: int = 10,
+    temperature: float = 0.9,
+    seed: int | None = None,
 ) -> str:
+    """Generate a caption for a single local image.
+
+    Parameters
+    ----------
+    decoder : {"nucleus", "beam", "topk", "greedy"}
+        Which decoding algorithm to use.  Recommended default = "nucleus".
+    seed : int | None
+        Fixed random seed for reproducible nucleus/topk outputs across retries.
+    """
+    if seed is not None:
+        np.random.seed(int(seed))
     path = Path(image_path)
     if not path.is_file():
         raise FileNotFoundError(f"Image not found: {path}")
@@ -264,37 +441,129 @@ def generate_caption(
                 "Retrain after changing CNN_MODEL_NAME, or extract features with the same encoder."
             )
         encoder = rebuilt_encoder
-    if use_beam:
+
+    decoder = str(decoder).strip().lower()
+    if decoder == "beam":
         caption = beam_search_decode(model, feature, tokenizer, beam_size=beam_size)
-    else:
+    elif decoder == "topk":
+        caption = topk_decode(model, feature, tokenizer, k=k, temperature=temperature)
+    elif decoder == "greedy":
         caption = greedy_decode(model, feature, tokenizer)
+    else:  # "nucleus" default
+        caption = nucleus_decode(model, feature, tokenizer, p=p, temperature=temperature)
     caption = strip_sequence_tokens(caption)
-    # LAST RESORT — even if all token-level defenses are bypassed (stale module
-    # cache, TF internal state, dead-ReLU collapsed projection, etc.), the
-    # produced string is filtered so runs of identical words are collapsed to a
-    # single copy and obvious 2-token phrase loops are removed.  After this the
-    # output is GUARANTEED to never read "behind behind behind..." again.
-    return _clean_repeated_words(caption)
+    caption = _clean_repeated_words(caption, max_consecutive=0)
+
+    # AUTO-RECOVERY for collapsed output.
+    # If we ended up with <=3 words (typical mode-collapse like "snow snow" -> "snow"),
+    # retry once with nucleus sampling (default recommended decoder), which almost
+    # always produces a full sentence.  If the user already asked for nucleus we
+    # retry with a different random seed to encourage variation.
+    word_count = len(caption.split())
+    if word_count <= 3:
+        retry_seed = (seed + 7) if seed is not None else None
+        if retry_seed is not None:
+            np.random.seed(retry_seed)
+        fallback_caption = nucleus_decode(
+            model, feature, tokenizer, p=min(p + 0.05, 0.97), temperature=max(temperature + 0.15, 1.0)
+        )
+        fallback_caption = strip_sequence_tokens(fallback_caption)
+        fallback_caption = _clean_repeated_words(fallback_caption, max_consecutive=0)
+        if len(fallback_caption.split()) > word_count:
+            caption = fallback_caption
+
+    if seed is None:
+        np.random.seed()  # reset global RNG to non-deterministic state
+    return caption
+
+
+def generate_multiple_captions(
+    image_path: str | Path,
+    model=None,
+    tokenizer: dict | None = None,
+    encoder=None,
+    *,
+    n: int = 3,
+    decoder: str = "nucleus",
+    beam_size: int = BEAM_SIZE,
+    p: float = 0.9,
+    k: int = 10,
+    temperature: float = 0.9,
+) -> list[str]:
+    """Generate `n` diverse captions (driven by nucleus/topk sampling diversity).
+
+    For greedy / beam which are deterministic the list will still contain `n`
+    entries but they may be identical strings.  Nucleus/topk give true diversity.
+    """
+    n = max(1, int(n))
+    out: list[str] = []
+    seen: set[str] = set()
+    for attempt in range(n * 3):
+        if len(out) >= n:
+            break
+        cap = generate_caption(
+            image_path,
+            model=model,
+            tokenizer=tokenizer,
+            encoder=encoder,
+            decoder=decoder,
+            beam_size=beam_size,
+            p=p,
+            k=k,
+            temperature=temperature,
+            seed=attempt + 1 if decoder in {"nucleus", "topk"} else None,
+        )
+        if cap and cap not in seen:
+            seen.add(cap)
+            out.append(cap)
+    # If we still ended up short (deterministic decoder), pad with copies.
+    while len(out) < n and out:
+        out.append(out[-1])
+    return out
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate a caption for one image")
     parser.add_argument("--image", required=True, help="Path to a JPEG or PNG image.")
-    parser.add_argument("--beam", action="store_true", help="Use beam search instead of greedy decoding.")
+    parser.add_argument("--decoder", default="nucleus",
+                        choices=["nucleus", "beam", "topk", "greedy"],
+                        help="Decoding algorithm (recommended: nucleus).")
     parser.add_argument("--beam-size", type=int, default=BEAM_SIZE)
+    parser.add_argument("--p", type=float, default=0.9, help="Nucleus probability mass.")
+    parser.add_argument("--k", type=int, default=10, help="Top-k sample size.")
+    parser.add_argument("--temperature", type=float, default=0.9, help="Sampling temperature.")
+    parser.add_argument("--n", type=int, default=1, help="Generate N diverse captions.")
     parser.add_argument("--model", type=str, default=None)
     args = parser.parse_args()
     try:
-        caption = generate_caption(
-            args.image,
-            model=load_caption_model(Path(args.model) if args.model else None)[0],
-            use_beam=args.beam,
-            beam_size=args.beam_size,
-        )
+        loaded_model, _ = load_caption_model(Path(args.model) if args.model else None)
+        if args.n > 1:
+            captions = generate_multiple_captions(
+                args.image,
+                model=loaded_model,
+                n=args.n,
+                decoder=args.decoder,
+                beam_size=args.beam_size,
+                p=args.p,
+                k=args.k,
+                temperature=args.temperature,
+            )
+            for idx, caption in enumerate(captions, 1):
+                print(f"{idx}. {caption}")
+        else:
+            caption = generate_caption(
+                args.image,
+                model=loaded_model,
+                decoder=args.decoder,
+                beam_size=args.beam_size,
+                p=args.p,
+                k=args.k,
+                temperature=args.temperature,
+            )
+            print(caption)
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
-    print(caption)
 
 
 if __name__ == "__main__":

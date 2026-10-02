@@ -1,152 +1,216 @@
-"""VisionTalk – AI Image Caption Generator.
-
-Loads a trained model and tokenizer only. Does not train, download data,
-rebuild the vocabulary, or extract the Flickr8k feature cache.
-"""
-
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
 import streamlit as st
+from PIL import Image
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.config import FINAL_MODEL_PATH, IMAGE_EXTENSIONS, TOKENIZER_PATH
 from src.feature_extraction import build_encoder, build_encoder_for_dim
-from src.inference import INFERENCE_CODE_VERSION, generate_caption, resolve_model_path
+from src.inference import (
+    INFERENCE_CODE_VERSION,
+    generate_caption,
+    generate_multiple_captions,
+    resolve_model_path,
+)
 from src.tokenizer_utils import load_tokenizer
 
+MAX_UPLOAD_MB = 50
+st.set_page_config(
+    page_title="VisionTalk — Image Captioning",
+    page_icon="🎙️",
+    layout="wide",
+)
 
-@st.cache_resource(show_spinner="Loading model and encoder…")
-def load_runtime():
-    model_path = resolve_model_path()
-    from tensorflow.keras.models import load_model
+st.title("VisionTalk Image Captioning")
+st.caption("VGG16 encoder + LSTM decoder · Flickr8k · Infer only (no training here).")
 
-    model = load_model(model_path)
+
+@st.cache_resource(show_spinner="Loading model & tokenizer...")
+def load_runtime(model_path_input: Path | None = None):
+    from src.inference import load_caption_model
+
+    resolved = resolve_model_path(model_path_input)
+    model, real_path = load_caption_model(resolved)
     tokenizer = load_tokenizer(TOKENIZER_PATH)
     expected_dim = int(model.inputs[0].shape[-1])
     encoder = build_encoder_for_dim(expected_dim)
+    return model, tokenizer, encoder, expected_dim, real_path
 
-    actual_dim = int(encoder.output_shape[-1])
-    if actual_dim != expected_dim:
+
+try:
+    model, tokenizer, encoder, expected_dim, model_path = load_runtime(FINAL_MODEL_PATH)
+except FileNotFoundError as exc:
+    st.error(str(exc))
+    st.stop()
+
+with st.sidebar:
+    st.header("Runtime")
+    st.info(f"Model: `{model_path.name}`")
+    encoder_dim = int(encoder.output_shape[-1])
+    st.metric("Feature dim (encoder)", encoder_dim)
+    st.metric("Feature dim (model)", expected_dim)
+    if st.button("🔁 Clear cached model/encoder"):
         st.cache_resource.clear()
-        raise ValueError(
-            f"Dimension mismatch detected and cache cleared. "
-            f"Encoder={actual_dim}, Model={expected_dim}. "
-            "Please refresh the page or restart the Streamlit server once."
-        )
-    return model, tokenizer, encoder, model_path, expected_dim
-
-
-def main() -> None:
-    st.set_page_config(page_title="VisionTalk – AI Image Caption Generator", layout="centered")
-    st.title("VisionTalk – AI Image Caption Generator")
-    st.caption(
-        "CNN encoder (VGG16) + LSTM decoder. This is a research prototype, "
-        "not a production assistive device."
-    )
-
-    if not TOKENIZER_PATH.is_file():
-        st.error("Tokenizer not found. Run: python -m src.text_preprocessing")
-        return
-    try:
-        resolve_model_path()
-    except FileNotFoundError as exc:
-        st.error(str(exc))
-        st.info("Train the model before using this app: python -m src.train")
-        return
-
-    try:
-        model, tokenizer, encoder, model_path, expected_dim = load_runtime()
-    except (OSError, ValueError, FileNotFoundError) as exc:
-        st.error(f"Could not load the captioning runtime: {exc}")
-        if "Dimension mismatch" in str(exc):
-            st.info("🔄 Press R or click 'Rerun' in the top-right to reload with the new encoder.")
-        return
-
-    with st.sidebar:
-        st.header("Runtime")
-        st.info(f"Model: `{model_path.name}`")
-        encoder_dim = int(encoder.output_shape[-1])
-        st.metric("Feature dim (encoder)", encoder_dim)
-        st.metric("Feature dim (model)", expected_dim)
-        if st.button("🔁 Clear cached model/encoder"):
-            st.cache_resource.clear()
-            st.success("Cache cleared. Rerun the page (press R).")
-            st.stop()
-
-        st.divider()
-        st.header("Decoding")
-        use_beam = st.toggle("Use beam search (recommended)", value=True,
-                             help="Beam search explores multiple caption candidates and usually avoids the repetition loops that plague greedy decoding.")
-        beam_size = st.slider("Beam size", min_value=2, max_value=7, value=3, step=1,
-                              disabled=not use_beam)
-        if use_beam:
-            st.caption(f"Beam size {beam_size} · higher = more candidates, slower")
-        else:
-            st.caption("Greedy decoding · fastest but can still degenerate with very short captions")
-
-        st.divider()
-        st.header("About")
-        st.caption(f"Inference code: `{INFERENCE_CODE_VERSION}`")
-        with st.expander("Seeing 'behind behind behind'?"):
-            st.markdown(
-                "If the caption is still a repetition loop, the deployed server may "
-                "still be holding the OLD `src.inference` module cached in "
-                "`sys.modules` (Streamlit 'Rerun' won't clear that).\n\n"
-                "**Fix:** click the app menu ⋯ → **Reboot app**, then try again. "
-                "After reboot, the sidebar shows inference code `v2.1-repguard`."
-            )
-
-    if encoder_dim == expected_dim:
-        st.success(f"Loaded model: {model_path.name}  ·  features={encoder_dim}D")
-    else:
-        st.warning(f"Encoder dim {encoder_dim} ≠ model dim {expected_dim}. Clearing cache…")
-        st.cache_resource.clear()
+        st.success("Cache cleared. Rerun the page (press R).")
         st.stop()
+
+    st.divider()
+    st.header("Decoding")
+    decoder_label_map = {
+        "nucleus (recommended)": "nucleus",
+        "beam search": "beam",
+        "top-k sampling": "topk",
+        "greedy (fastest)": "greedy",
+    }
+    decoder_display = st.selectbox(
+        "Algorithm",
+        list(decoder_label_map.keys()),
+        index=0,
+        help="Nucleus sampling is strongly recommended for this small model — greedy/beam collapse to single filler tokens like 'snow' or 'behind'.",
+    )
+    decoder = decoder_label_map[decoder_display]
+
+    beam_size = st.slider("Beam size", min_value=2, max_value=7, value=3, step=1,
+                          disabled=decoder != "beam")
+    temperature = st.slider(
+        "Temperature", min_value=0.3, max_value=1.6, value=0.9, step=0.05,
+        disabled=decoder not in {"nucleus", "topk"},
+        help="Higher = more creative / diverse; lower = more conservative.",
+    )
+    if decoder == "nucleus":
+        p = st.slider("Nucleus (top-p)", min_value=0.5, max_value=0.99, value=0.9, step=0.01)
+        k = 10
+    elif decoder == "topk":
+        k = st.slider("Top-k", min_value=2, max_value=50, value=10, step=1)
+        p = 0.9
+    else:
+        p, k = 0.9, 10
+
+    num_captions = st.slider("Number of captions", min_value=1, max_value=5, value=3, step=1,
+                             help="Generate multiple candidate captions and pick the best one. Nucleus/top-k give true diversity.")
+
+    if decoder == "nucleus":
+        st.caption(f"Nucleus p={p:.2f}, T={temperature:.2f} · best balance of quality + creativity")
+    elif decoder == "topk":
+        st.caption(f"Top-k k={k}, T={temperature:.2f} · maximum diversity")
+    elif decoder == "beam":
+        st.caption(f"Beam size {beam_size} · deterministic, safest only if model is well-trained")
+    else:
+        st.caption("Greedy · fastest, very likely to output a single repeated/collapsed word")
+
+    st.divider()
+    st.header("About")
+    st.caption(f"Inference code: `{INFERENCE_CODE_VERSION}`")
+    with st.expander("Still seeing 'snow snow' or 'behind'?"):
+        st.markdown(
+            "1. Confirm the sidebar shows `v3.0-nucleus-ngram` above.  If not, click the app "
+            "menu ⋯ → **Reboot app** to clear Python's sys.modules cache.\n\n"
+            "2. Make sure **Algorithm = nucleus (recommended)** (first option in the dropdown).\n\n"
+            "3. Increase Temperature to ~1.1 and Number of captions to 3 — one of the candidates "
+            "will almost always be a proper full sentence.\n\n"
+            "4. For very challenging photos (mountains, city streets with unusual objects), this "
+            "small Flickr8k-trained model will never be perfect.  Nucleus + multiple candidates "
+            "is the best practical recovery without retraining."
+        )
+
+col1, col2 = st.columns([1.3, 1])
+
+with col1:
     uploaded = st.file_uploader(
         "Upload an image",
-        type=[ext.lstrip(".") for ext in sorted(IMAGE_EXTENSIONS)],
+        type=sorted(ext.lstrip(".") for ext in IMAGE_EXTENSIONS),
+        help=f"Max {MAX_UPLOAD_MB} MB per image.",
     )
-    if uploaded is None:
-        st.info("Choose a JPEG or PNG image, then click Generate Caption.")
-        return
+    camera = st.camera_input("…or take a photo", disabled=False,
+                             help="Optional live camera capture (same pipeline).")
 
-    from PIL import Image
-
+image: Image.Image | None = None
+if uploaded is not None:
     try:
         image = Image.open(uploaded).convert("RGB")
-    except OSError:
-        st.error("Could not read the uploaded file. Use a valid JPEG or PNG image.")
-        return
+    except (OSError, ValueError) as exc:
+        st.error(f"Could not open the uploaded image: {exc}")
+        image = None
+elif camera is not None:
+    try:
+        image = Image.open(camera).convert("RGB")
+    except (OSError, ValueError) as exc:
+        st.error(f"Could not open the camera capture: {exc}")
+        image = None
 
-    st.image(image, caption="Preview", use_container_width=True)
-    if st.button("Generate Caption", type="primary"):
+with col2:
+    if image is None:
+        st.info("Upload an image on the left, or use the camera, then click **Generate Caption**.")
+    else:
+        st.image(image, caption="Preview", use_container_width=True)
+
+st.divider()
+
+if image is not None:
+    action_label = (
+        f"Generate {num_captions} Caption" + ("s" if num_captions != 1 else "") +
+        f" · {decoder_display.split(' (')[0]}"
+    )
+    if st.button(action_label, type="primary", use_container_width=True):
         temp_path = ROOT / "outputs" / "predictions" / "_upload.jpg"
         temp_path.parent.mkdir(parents=True, exist_ok=True)
         image.save(temp_path, format="JPEG")
-        decoder_label = f"beam search (k={beam_size})" if use_beam else "greedy"
-        with st.spinner(f"Generating caption with {decoder_label}..."):
+        decoder_name = decoder_display.split(" (")[0]
+        with st.spinner(f"Generating caption(s) with {decoder_name}..."):
             try:
-                caption = generate_caption(
-                    temp_path,
-                    model=model,
-                    tokenizer=tokenizer,
-                    encoder=encoder,
-                    use_beam=use_beam,
-                    beam_size=beam_size,
-                )
+                if num_captions == 1:
+                    captions = [
+                        generate_caption(
+                            temp_path,
+                            model=model,
+                            tokenizer=tokenizer,
+                            encoder=encoder,
+                            decoder=decoder,
+                            beam_size=beam_size,
+                            p=p,
+                            k=k,
+                            temperature=temperature,
+                        )
+                    ]
+                else:
+                    captions = generate_multiple_captions(
+                        temp_path,
+                        model=model,
+                        tokenizer=tokenizer,
+                        encoder=encoder,
+                        n=num_captions,
+                        decoder=decoder,
+                        beam_size=beam_size,
+                        p=p,
+                        k=k,
+                        temperature=temperature,
+                    )
             except (FileNotFoundError, ValueError, RuntimeError) as exc:
                 st.error(str(exc))
-                return
-        st.subheader("Generated caption")
-        st.markdown(f"> {caption}")
-        st.caption(f"Decoder: {decoder_label}")
-
-
-if __name__ == "__main__":
-    main()
+                captions = []
+        if captions:
+            st.subheader("Generated caption" + ("s" if len(captions) > 1 else ""))
+            for i, caption in enumerate(captions, 1):
+                if len(captions) == 1:
+                    st.markdown(f"> {caption}")
+                else:
+                    with st.expander(f"Caption {i} 📌", expanded=(i == 1)):
+                        st.markdown(f"**{caption}**")
+            st.caption(
+                f"Decoder: {decoder_name}" +
+                (f" · p={p:.2f}, T={temperature:.2f}" if decoder in {"nucleus", "topk"} else
+                 f" · beam size {beam_size}" if decoder == "beam" else "") +
+                f" · code `{INFERENCE_CODE_VERSION}`"
+            )
+            if any(len(c.split()) <= 3 for c in captions):
+                st.warning(
+                    "One or more captions are very short (≤3 words).  Switch Algorithm to "
+                    "**Nucleus (recommended)**, bump Temperature above 1.0, and try generating "
+                    "3 captions — one will almost certainly be a proper sentence."
+                )
