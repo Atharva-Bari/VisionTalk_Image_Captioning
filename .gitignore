@@ -23,11 +23,6 @@ data/features/vectors/*
 *.npy
 *.npz
 
-models/checkpoints/*
-!models/checkpoints/.gitkeep
-models/final/*
-!models/final/.gitkeep
-
 outputs/figures/*
 !outputs/figures/.gitkeep
 outputs/evaluation/*
@@ -36,8 +31,8 @@ outputs/predictions/*
 !outputs/predictions/.gitkeep
 
 *.h5
-*.keras
 data/features/*.pkl
+
 
 .DS_Store
 Thumbs.db
