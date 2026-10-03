@@ -52,6 +52,8 @@ TOKENIZER_PATH = DATA_PROCESSED_DIR / "tokenizer.pkl"
 METADATA_PATH = DATA_PROCESSED_DIR / "metadata.json"
 FEATURES_CACHE_PATH = DATA_FEATURES_DIR / "image_features.pkl"
 FEATURES_VECTOR_DIR = DATA_FEATURES_DIR / "vectors"
+REGION_FEATURES_DIR = DATA_FEATURES_DIR / "vgg16_regions"
+REGION_FEATURES_METADATA_PATH = DATA_FEATURES_DIR / "region_extractor_metadata.json"
 FEATURES_METADATA_PATH = DATA_FEATURES_DIR / "extractor_metadata.json"
 SPLIT_PATH = DATA_PROCESSED_DIR / "splits.json"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -117,6 +119,7 @@ def ensure_project_directories() -> None:
         DATA_PROCESSED_DIR,
         DATA_FEATURES_DIR,
         FEATURES_VECTOR_DIR,
+        REGION_FEATURES_DIR,
         CHECKPOINTS_DIR,
         FINAL_MODEL_DIR,
         NOTEBOOKS_DIR,

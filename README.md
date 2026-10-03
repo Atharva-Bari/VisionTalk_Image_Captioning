@@ -52,23 +52,24 @@ Treat demo captions as research output, not ground truth.
 
 ```
 IMAGE
-  → pretrained CNN encoder (EfficientNetB0, classifier head removed)
-  → image feature vector (length 1280)
-  → Dense + Dropout          (image branch)
+  → pretrained VGG16 convolutional encoder (classifier removed)
+  → 7 × 7 spatial grid of 512-D visual features
 
 PARTIAL CAPTION
   → word IDs (padded)
   → Embedding
-  → LSTM                     (caption branch)
+  → LSTM query                (language context)
 
-CONCATENATE image branch + LSTM output
+LSTM query + image grid
+  → spatial attention over the uploaded image
+  → attended visual context + language context
   → Dense
   → Softmax over vocabulary
   → next word
   → append word, repeat until endseq or max length
 ```
 
-Training uses **teacher forcing**: the model sees the true prefix `startseq a dog` and must predict `is`, then `running`, then `endseq`, rather than its own previous guesses.
+The attention model predicts each next word using both the current caption prefix and a learned weighted combination of the uploaded image's 49 spatial regions. Training uses **teacher forcing**: the model sees a true prefix such as `startseq a dog` and predicts the next word.
 
 Inference uses the model's own predictions (greedy argmax by default).
 
@@ -198,19 +199,17 @@ python -m src.feature_extraction
 
 ## Training
 
-Default `EPOCHS = 3` in `src/config.py` is only a pipeline smoke test. After the pipeline works, increase `EPOCHS` to **20–50**.
+Build the resumable VGG16 spatial-feature cache, then train the attention model. This is separate from the old 4096-D vector cache and does not overwrite the deployed checkpoint:
 
 ```powershell
-python -m src.train
+python -m src.train_attention --extract-only
+python -m src.train_attention --epochs 30
+python -m src.evaluate_attention --max-images 10
 ```
 
-Resume from `models/checkpoints/latest_caption_model.keras`:
+The attention candidate is saved as `models/final/attention_caption_model.keras`. The category-stratified command above prints captions and references from held-out images; check its CSV/JSON under `outputs/predictions/` before promoting it to `models/final/caption_model.keras`. Use `python -m src.evaluation --no-viz` to assess the prior non-attention checkpoint.
 
-```powershell
-python -m src.train --resume
-```
-
-Callbacks: best checkpoint (never replaced by a worse `val_loss`), latest checkpoint every epoch, early stopping, reduce learning rate on plateau. Existing checkpoints are not deleted.
+Training uses the original image-level Flickr8k train/validation/test split and keeps the test split out of fitting.
 
 ## Inference
 

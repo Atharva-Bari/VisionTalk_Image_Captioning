@@ -26,7 +26,7 @@ from src.tokenizer_utils import load_tokenizer, pad_sequences, sequence_to_text
 from src.utils import strip_sequence_tokens
 
 
-INFERENCE_CODE_VERSION = "v3.1-beam-quality-gate"  # Shown in UI to confirm deployed version
+INFERENCE_CODE_VERSION = "v4-spatial-attention"  # Shown in UI to confirm deployed version
 
 _FUNCTION_WORDS = {
     "a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "at",
@@ -90,12 +90,35 @@ def _special_ids(tokenizer: dict) -> tuple[int, int]:
 
 
 def _normalize_feature_for_model(image_feature: np.ndarray) -> np.ndarray:
-    """Apply the checkpoint's trained L2 feature normalization at inference."""
-    feature = np.asarray(image_feature, dtype=np.float32).reshape(-1)
+    """Normalize legacy vectors while preserving spatial region tensors."""
+    feature = np.asarray(image_feature, dtype=np.float32)
+    if feature.ndim > 1:
+        return feature
+    feature = feature.reshape(-1)
     norm = float(np.linalg.norm(feature))
     if norm > 1e-8:
         feature = feature / norm
     return feature
+
+
+def _model_feature_batch(image_feature: np.ndarray) -> np.ndarray:
+    feature = np.asarray(image_feature, dtype=np.float32)
+    if feature.ndim == 1:
+        return feature.reshape(1, -1)
+    return feature.reshape((1,) + feature.shape)
+
+
+def _predict_next_probs(model, feature_batch: np.ndarray, padded_prefix: np.ndarray,
+                        prefix_length: int) -> np.ndarray:
+    """Read the next-token distribution from either legacy or seq2seq models."""
+    prediction = np.asarray(model.predict([feature_batch, padded_prefix], verbose=0))
+    if prediction.ndim == 3:
+        # pad_sequences() in this project is pre-padding: the most recent
+        # prefix token is always at the final position of the fixed-width input.
+        # The sequence captioner is trained to predict the next token there.
+        step = prediction.shape[1] - 1
+        return prediction[0, step]
+    return prediction[0]
 
 
 def _suppress_recent_tokens(probs, seq, block_size: int = 3, penalty: float = 1e-8) -> np.ndarray:
@@ -268,11 +291,11 @@ def greedy_decode(
 ) -> str:
     start_id, end_id = _special_ids(tokenizer)
     max_length = int(max_length or tokenizer.get("max_caption_length") or 20)
-    feature = np.asarray(image_feature, dtype=np.float32).reshape(1, -1)
+    feature = _model_feature_batch(image_feature)
     token_ids = [start_id]
     for _ in range(max_length):
         padded = pad_sequences([token_ids], max_length)
-        raw = model.predict([feature, padded], verbose=0)[0]
+        raw = _predict_next_probs(model, feature, padded, len(token_ids))
         probs = _suppress_recent_tokens(raw, token_ids[1:], block_size=4, penalty=1e-9)
         next_id = _pick_next_id_without_repeat(probs, token_ids[1:], end_id, fallback="argmax")
         if next_id == end_id or next_id == 0:
@@ -292,7 +315,7 @@ def beam_search_decode(
 ) -> str:
     start_id, end_id = _special_ids(tokenizer)
     max_length = int(max_length or tokenizer.get("max_caption_length") or 20)
-    feature = np.asarray(image_feature, dtype=np.float32).reshape(1, -1)
+    feature = _model_feature_batch(image_feature)
     beams: list[tuple[float, list[int], bool]] = [(0.0, [start_id], False)]
     completed: list[tuple[float, list[int]]] = []
 
@@ -303,7 +326,7 @@ def beam_search_decode(
                 completed.append((score, seq))
                 continue
             padded = pad_sequences([seq], max_length)
-            raw = model.predict([feature, padded], verbose=0)[0]
+            raw = _predict_next_probs(model, feature, padded, len(seq))
             probs = _suppress_recent_tokens(raw, seq[1:], block_size=3, penalty=1e-7)
             # For beam expansion we still use pure ranked argmax (no sampling);
             # but _pick_next_id_without_repeat walks down the ranking until a
@@ -384,12 +407,12 @@ def nucleus_decode(
     """
     start_id, end_id = _special_ids(tokenizer)
     max_length = int(max_length or tokenizer.get("max_caption_length") or 20)
-    feature = np.asarray(image_feature, dtype=np.float32).reshape(1, -1)
+    feature = _model_feature_batch(image_feature)
     token_ids = [start_id]
     sample_params = {"p": float(p), "temperature": float(temperature)}
     for _ in range(max_length):
         padded = pad_sequences([token_ids], max_length)
-        raw = model.predict([feature, padded], verbose=0)[0]
+        raw = _predict_next_probs(model, feature, padded, len(token_ids))
         probs = _suppress_recent_tokens(raw, token_ids[1:], block_size=3, penalty=1e-7)
         next_id = _pick_next_id_without_repeat(
             probs, token_ids[1:], end_id, fallback="nucleus", sample_params=sample_params
@@ -414,12 +437,12 @@ def topk_decode(
     """Top-k sampling decoder — alternative to nucleus for more diversity."""
     start_id, end_id = _special_ids(tokenizer)
     max_length = int(max_length or tokenizer.get("max_caption_length") or 20)
-    feature = np.asarray(image_feature, dtype=np.float32).reshape(1, -1)
+    feature = _model_feature_batch(image_feature)
     token_ids = [start_id]
     sample_params = {"k": int(k), "temperature": float(temperature)}
     for _ in range(max_length):
         padded = pad_sequences([token_ids], max_length)
-        raw = model.predict([feature, padded], verbose=0)[0]
+        raw = _predict_next_probs(model, feature, padded, len(token_ids))
         probs = _suppress_recent_tokens(raw, token_ids[1:], block_size=3, penalty=1e-7)
         next_id = _pick_next_id_without_repeat(
             probs, token_ids[1:], end_id, fallback="topk", sample_params=sample_params
@@ -467,21 +490,29 @@ def generate_caption(
         tokenizer = load_tokenizer(TOKENIZER_PATH)
     if model is None:
         model, _ = load_caption_model()
-    expected_dim = int(model.inputs[0].shape[-1] or FEATURE_VECTOR_DIM)
-    if encoder is None:
-        encoder = build_encoder_for_dim(expected_dim)
-    feature = _normalize_feature_for_model(extract_single_image_feature(path, encoder=encoder))
-    if feature.shape[-1] != expected_dim:
-        rebuilt_encoder = build_encoder_for_dim(expected_dim)
-        feature = _normalize_feature_for_model(
-            extract_single_image_feature(path, encoder=rebuilt_encoder)
+    expected_shape = tuple(int(d) for d in model.inputs[0].shape[1:])
+    if len(expected_shape) == 2:
+        from src.region_feature_extraction import build_region_encoder, extract_image_regions
+
+        if encoder is None:
+            encoder = build_region_encoder()
+        feature = extract_image_regions(path, encoder=encoder)
+        if tuple(feature.shape) != expected_shape:
+            encoder = build_region_encoder()
+            feature = extract_image_regions(path, encoder=encoder)
+    else:
+        expected_dim = int(expected_shape[-1] if expected_shape else FEATURE_VECTOR_DIM)
+        if encoder is None:
+            encoder = build_encoder_for_dim(expected_dim)
+        feature = _normalize_feature_for_model(extract_single_image_feature(path, encoder=encoder))
+        if feature.shape != expected_shape:
+            encoder = build_encoder_for_dim(expected_dim)
+            feature = _normalize_feature_for_model(extract_single_image_feature(path, encoder=encoder))
+    if tuple(feature.shape) != expected_shape:
+        raise ValueError(
+            f"CNN features have shape {feature.shape}, but model expects {expected_shape}. "
+            "Use the VGG16 extractor configuration used to train this checkpoint."
         )
-        if feature.shape[-1] != expected_dim:
-            raise ValueError(
-                f"CNN feature size {feature.shape[-1]} does not match model input {expected_dim}. "
-                "Retrain after changing CNN_MODEL_NAME, or extract features with the same encoder."
-            )
-        encoder = rebuilt_encoder
 
     decoder = str(decoder).strip().lower()
     if decoder == "beam":

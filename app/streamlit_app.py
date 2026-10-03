@@ -17,11 +17,13 @@ if str(ROOT) not in sys.path:
 import src.config as _config_module
 import src.feature_extraction as _feature_extraction_module
 import src.inference as _inference_module
+import src.region_feature_extraction as _region_feature_extraction_module
 
 importlib.invalidate_caches()
 importlib.reload(_config_module)
 importlib.reload(_feature_extraction_module)
 importlib.reload(_inference_module)
+importlib.reload(_region_feature_extraction_module)
 
 from src.config import (
     CNN_MODEL_NAME,
@@ -53,7 +55,7 @@ def load_runtime():
     resolved = resolve_model_path(FINAL_MODEL_PATH)
     model, _ = load_caption_model(resolved)
     tokenizer = load_tokenizer(TOKENIZER_PATH)
-    expected_dim = int(model.inputs[0].shape[-1])
+    expected_shape = tuple(int(dim) for dim in model.inputs[0].shape[1:])
     if int(model.output_shape[-1]) != int(tokenizer["vocab_size"]):
         raise ValueError(
             f"Model vocabulary dimension {model.output_shape[-1]} does not match tokenizer "
@@ -65,15 +67,22 @@ def load_runtime():
         raise ValueError("Tokenizer word/id mappings are inconsistent; refusing to decode model output.")
     if len(model.inputs) < 2 or int(model.inputs[1].shape[-1]) != int(tokenizer["max_caption_length"]):
         raise ValueError("Model caption-sequence length does not match the saved tokenizer metadata.")
-    encoder = build_encoder_for_dim(expected_dim)
-    actual_dim = int(encoder.output_shape[-1])
-    if actual_dim != expected_dim:
-        raise ValueError(f"Encoder outputs {actual_dim} features, but the model expects {expected_dim}.")
-    return model, tokenizer, encoder, resolved, expected_dim
+    if len(expected_shape) == 2:
+        from src.region_feature_extraction import build_region_encoder
+        encoder = build_region_encoder()
+        actual_shape = tuple(int(dim) for dim in encoder.output_shape[1:])
+        if actual_shape != (7, 7, expected_shape[-1]):
+            raise ValueError(f"Spatial encoder output {actual_shape} is incompatible with model input {expected_shape}.")
+    else:
+        encoder = build_encoder_for_dim(expected_shape[-1])
+        actual_shape = tuple(int(dim) for dim in encoder.output_shape[1:])
+        if actual_shape != expected_shape:
+            raise ValueError(f"Encoder outputs {actual_shape} features, but the model expects {expected_shape}.")
+    return model, tokenizer, encoder, resolved, expected_shape
 
 
 try:
-    model, tokenizer, encoder, model_path, expected_dim = load_runtime()
+    model, tokenizer, encoder, model_path, expected_shape = load_runtime()
 except (FileNotFoundError, OSError, ValueError) as exc:
     st.error(f"Captioning runtime failed validation: {exc}")
     st.stop()
@@ -85,15 +94,15 @@ with st.expander("Model Diagnostics"):
         "encoder loaded": "YES",
         "model file": str(model_path),
         "tokenizer file": str(TOKENIZER_PATH),
-        "model image input dimension": expected_dim,
-        "encoder feature dimension": int(encoder.output_shape[-1]),
+        "model image input shape": expected_shape,
+        "encoder feature shape": tuple(int(dim) for dim in encoder.output_shape[1:]),
         "model text input length": int(model.inputs[1].shape[-1]),
         "vocabulary size": int(tokenizer["vocab_size"]),
-        "configured feature dimension": FEATURE_VECTOR_DIM,
+        "configured legacy feature dimension": FEATURE_VECTOR_DIM,
         "feature normalization": getattr(
             sys.modules.get("src.config"), "NORM_VGG16_FEATURES", "l2"
         ),
-        "CNN encoder": f"{CNN_MODEL_NAME} ({CNN_POOLING}), image size={IMAGE_SIZE}",
+        "CNN encoder": f"{CNN_MODEL_NAME} spatial feature grid, image size={IMAGE_SIZE}",
         "inference function": "src.inference.generate_caption",
         "decoder": "beam search (quality-gated; greedy retry)",
         "inference code version": INFERENCE_CODE_VERSION,
