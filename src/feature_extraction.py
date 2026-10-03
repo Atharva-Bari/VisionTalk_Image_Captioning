@@ -23,6 +23,7 @@ from src.config import (
     FEATURES_VECTOR_DIR,
     IMAGE_SIZE,
     IMAGE_EXTENSIONS,
+    NORM_VGG16_FEATURES,
     ensure_project_directories,
     resolve_images_dir,
 )
@@ -53,27 +54,41 @@ def expected_extractor_metadata(feature_dim: int) -> dict:
     return {
         "cnn_model_name": CNN_MODEL_NAME,
         "weights": CNN_WEIGHTS,
-        "include_top": True,
+        "include_top": CNN_POOLING == "fc",
         "pooling": CNN_POOLING,
         "image_size": list(IMAGE_SIZE),
         "preprocess": EXTRACTOR_PREPROCESS,
         "feature_vector_dim": feature_dim,
+        "feature_normalization": NORM_VGG16_FEATURES,
     }
 
 
 def _ensure_metadata_compatible(existing: dict, expected: dict, force: bool) -> None:
     if not existing or force:
         return
-    for key in ("cnn_model_name", "weights", "include_top", "pooling", "preprocess", "feature_vector_dim"):
-        if key in existing and existing[key] != expected[key]:
+    for key in (
+        "cnn_model_name",
+        "weights",
+        "include_top",
+        "pooling",
+        "preprocess",
+        "feature_vector_dim",
+        "feature_normalization",
+    ):
+        if key not in existing:
+            raise ValueError(
+                f"Cached feature metadata is missing {key!r}; its extractor cannot be verified. "
+                "Re-run with --force to rebuild the cache."
+            )
+        if existing[key] != expected[key]:
             raise ValueError(
                 f"Cached features used {key}={existing[key]!r}, but config expects "
                 f"{expected[key]!r}. Re-run with --force to rebuild the cache, or "
                 "change src/config.py to match the cached extractor."
             )
-    if existing.get("image_size") and existing["image_size"] != expected["image_size"]:
+    if "image_size" not in existing or existing["image_size"] != expected["image_size"]:
         raise ValueError(
-            f"Cached features used image_size={existing['image_size']}, "
+            f"Cached features used image_size={existing.get('image_size')}, "
             f"but config expects {expected['image_size']}. Re-run with --force to rebuild."
         )
 
@@ -115,20 +130,40 @@ def _build_encoder_variant(variant):
 
 
 def build_encoder():
-    """Frozen VGG16 using the fc2 (penultimate) layer for 4096-dim features."""
-    return _build_encoder_variant("fc")
+    """Frozen VGG16 encoder.
+
+    When CNN_POOLING == "fc" (default and recommended):
+        - Load VGG16 with include_top=True so the fc1/fc2 4096-dim heads are
+          included.
+        - Return a Keras Model whose output is the fc2 layer (the 4096-dim
+          ReLU activation right before the 1000-way ImageNet softmax).
+        - This 4096-dim semantic vector is 8x richer than 512-dim global
+          average pool, and the larger values (~0-40) prevent the decoder's
+          first projection Dense from dying to an all-zero ReLU.
+    When CNN_POOLING in {"avg", "max"}:
+        - Load VGG16 include_top=False and apply that pooling to the conv5
+          feature grid (produces 512-dim vector).  Original legacy behaviour.
+    """
+    return _build_encoder_variant(CNN_POOLING if CNN_POOLING else "avg")
 
 
 def build_encoder_for_dim(target_feature_dim: int):
     """Build a VGG16 encoder whose output dimension matches target_feature_dim.
 
-    Tries the default fc2 (4096-D) first, then falls back to global average
-    or max pooling (512-D variants) until the requested dimension is produced.
-    This protects against configuration drift between the training environment
-    and the deployed Streamlit runtime.
+    Tries the configured CNN_POOLING first, then falls back to the other
+    common variants ("fc" -> 4096, "avg" -> 512) until one produces the
+    requested feature dimension.  This protects against configuration drift
+    between the training environment (which produced a saved .keras model
+    expecting, say, 4096-D features) and the deployed Streamlit runtime
+    where CNN_POOLING may have been set differently.
     """
     target = int(target_feature_dim)
-    ordered_variants = ["fc", "avg", "max"]
+    ordered_variants = []
+    if CNN_POOLING and CNN_POOLING not in ordered_variants:
+        ordered_variants.append(CNN_POOLING)
+    for v in ("fc", "avg", "max"):
+        if v not in ordered_variants:
+            ordered_variants.append(v)
 
     last_error = None
     for variant in ordered_variants:
@@ -140,8 +175,11 @@ def build_encoder_for_dim(target_feature_dim: int):
         out_dim = int(encoder.output_shape[-1])
         if out_dim == target:
             return encoder
+        # Otherwise this variant produces the wrong size; discard and try next
         del encoder
 
+    # If nothing matched (unusual), fall back to the default config choice
+    # and let the caller surface a clearer error.
     try:
         return build_encoder()
     except Exception:
@@ -173,10 +211,28 @@ def _is_valid_vector(path: Path, feature_dim: int) -> bool:
     return vector.shape == (feature_dim,)
 
 
+def _normalize_features(vectors: np.ndarray) -> np.ndarray:
+    """Apply L2 or zscore normalization to a feature batch (prevents dead ReLU)."""
+    v = np.asarray(vectors, dtype=np.float32)
+    if NORM_VGG16_FEATURES == "l2":
+        norms = np.linalg.norm(v, axis=1, keepdims=True)
+        norms = np.where(norms < 1e-8, 1.0, norms)
+        return v / norms
+    if NORM_VGG16_FEATURES == "zscore":
+        mean = v.mean(axis=1, keepdims=True)
+        std = v.std(axis=1, keepdims=True)
+        std = np.where(std < 1e-8, 1.0, std)
+        return (v - mean) / std
+    return v
+
+
 def _extract_batch(encoder, arrays: np.ndarray) -> np.ndarray:
     preprocessed = _preprocess_batch(arrays)
     features = encoder.predict(preprocessed, verbose=0)
-    return np.asarray(features, dtype=np.float32)
+    features = np.asarray(features, dtype=np.float32)
+    if features.ndim != 2:
+        features = features.reshape(features.shape[0], -1)
+    return _normalize_features(features)
 
 
 def extract_features(
@@ -224,7 +280,7 @@ def extract_features(
         nonlocal encoder, feature_dim, expected_meta
         if encoder is not None:
             return
-        print(f"Loading pretrained {CNN_MODEL_NAME} (include_top=True, fc2 layer output)..." )
+        print(f"Loading pretrained {CNN_MODEL_NAME} (include_top=False, pooling={CNN_POOLING})...")
         encoder = build_encoder()
         feature_dim = int(encoder.output_shape[-1])
         expected_meta = expected_extractor_metadata(feature_dim)

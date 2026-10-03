@@ -53,7 +53,14 @@ def _feature_dim() -> int:
         meta = load_json(FEATURES_METADATA_PATH)
         dim = meta.get("feature_vector_dim")
         if dim is not None:
-            return int(dim)
+            dim = int(dim)
+            if dim != FEATURE_VECTOR_DIM:
+                raise ValueError(
+                    f"Feature metadata declares {dim}-D vectors, but src/config.py expects "
+                    f"{FEATURE_VECTOR_DIM}-D vectors. Rebuild features with "
+                    "python -m src.feature_extraction --force before training."
+                )
+            return dim
     return FEATURE_VECTOR_DIM
 
 

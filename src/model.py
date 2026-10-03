@@ -8,13 +8,16 @@ from __future__ import annotations
 from tensorflow.keras import Model
 from tensorflow.keras.layers import (
     LSTM,
+    BatchNormalization,
     Concatenate,
     Dense,
     Dropout,
     Embedding,
     Input,
+    LeakyReLU,
 )
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.initializers import HeNormal
 
 from src.config import (
     DENSE_UNITS,
@@ -43,8 +46,15 @@ def build_caption_model(
         raise ValueError(f"max_length must be at least 2, got {max_length}.")
 
     image_input = Input(shape=(feature_dim,), name="image_features")
-    image_dense = Dense(dense_units, activation="relu", name="image_dense")(image_input)
-    image_drop = Dropout(dropout, name="image_dropout")(image_dense)
+    image_bn = BatchNormalization(name="image_bn")(image_input)
+    image_dense = Dense(
+        dense_units,
+        kernel_initializer=HeNormal(),
+        use_bias=True,
+        name="image_dense",
+    )(image_bn)
+    image_act = LeakyReLU(negative_slope=0.1, name="image_leaky_relu")(image_dense)
+    image_drop = Dropout(dropout, name="image_dropout")(image_act)
 
     caption_input = Input(shape=(max_length,), name="caption_sequence")
     embedded = Embedding(
@@ -56,7 +66,12 @@ def build_caption_model(
     lstm_out = LSTM(lstm_units, name="caption_lstm")(embedded)
 
     merged = Concatenate(name="merge")([image_drop, lstm_out])
-    fused = Dense(dense_units, activation="relu", name="fusion_dense")(merged)
+    fused = Dense(
+        dense_units,
+        kernel_initializer=HeNormal(),
+        name="fusion_dense",
+    )(merged)
+    fused = LeakyReLU(negative_slope=0.1, name="fusion_leaky_relu")(fused)
     fused = Dropout(dropout, name="fusion_dropout")(fused)
     output = Dense(vocab_size, activation="softmax", name="next_word")(fused)
 

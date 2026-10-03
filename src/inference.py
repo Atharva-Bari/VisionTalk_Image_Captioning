@@ -26,7 +26,37 @@ from src.tokenizer_utils import load_tokenizer, pad_sequences, sequence_to_text
 from src.utils import strip_sequence_tokens
 
 
-INFERENCE_CODE_VERSION = "v3.0-nucleus-ngram"  # Shown in UI to confirm deployed version
+INFERENCE_CODE_VERSION = "v3.1-beam-quality-gate"  # Shown in UI to confirm deployed version
+
+_FUNCTION_WORDS = {
+    "a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "at",
+    "with", "by", "from", "for", "is", "are", "was", "were", "be", "being",
+    "has", "have", "had", "wearing", "while", "as", "near", "into", "through",
+    "over", "under", "beside", "behind", "across", "around", "up", "down",
+}
+_SPECIAL_WORDS = {"unk", "<unk>", "pad", "startseq", "endseq"}
+
+
+def caption_quality_issues(caption: str) -> list[str]:
+    """Return reasons a generated caption looks corrupted or unusable."""
+    words = [word.strip(".,!?;:\"'()[]{}").lower() for word in str(caption).split()]
+    words = [word for word in words if word]
+    issues: list[str] = []
+    if len(words) < 3:
+        issues.append("caption is too short")
+    if len(words) > 24:
+        issues.append("caption is abnormally long")
+    if any(word in _SPECIAL_WORDS for word in words):
+        issues.append("caption contains an unknown or special token")
+    if words and len(set(words)) / len(words) < 0.55:
+        issues.append("caption has too little vocabulary diversity")
+    if any(words.count(word) >= 4 for word in set(words)):
+        issues.append("caption repeats a word excessively")
+    if any(left == right for left, right in zip(words, words[1:])):
+        issues.append("caption has adjacent repeated words")
+    if len(words) >= 5 and not any(word in _FUNCTION_WORDS for word in words):
+        issues.append("caption lacks basic sentence structure")
+    return issues
 
 
 def resolve_model_path(model_path: Path | None = None) -> Path:
@@ -206,11 +236,11 @@ def _pick_next_id_without_repeat(
         sampled = _sample_topk(probs, **params)
         ranked = np.concatenate([[sampled], ranked[ranked != sampled]])
 
-    last_ok = 0
     for candidate in ranked:
         c = int(candidate)
-        if c in (0, end_id):
-            last_ok = c
+        if c == end_id:
+            return c
+        if c == 0:
             continue
         if prefix and prefix[-1] == c:
             continue
@@ -399,7 +429,7 @@ def generate_caption(
     tokenizer: dict | None = None,
     encoder=None,
     *,
-    decoder: str = "nucleus",
+    decoder: str = "beam",
     beam_size: int = BEAM_SIZE,
     p: float = 0.9,
     k: int = 10,
@@ -411,7 +441,7 @@ def generate_caption(
     Parameters
     ----------
     decoder : {"nucleus", "beam", "topk", "greedy"}
-        Which decoding algorithm to use.  Recommended default = "nucleus".
+        Which decoding algorithm to use. Beam search is the default for stable captions.
     seed : int | None
         Fixed random seed for reproducible nucleus/topk outputs across retries.
     """
@@ -451,26 +481,22 @@ def generate_caption(
         caption = greedy_decode(model, feature, tokenizer)
     else:  # "nucleus" default
         caption = nucleus_decode(model, feature, tokenizer, p=p, temperature=temperature)
-    caption = strip_sequence_tokens(caption)
-    caption = _clean_repeated_words(caption, max_consecutive=0)
-
-    # AUTO-RECOVERY for collapsed output.
-    # If we ended up with <=3 words (typical mode-collapse like "snow snow" -> "snow"),
-    # retry once with nucleus sampling (default recommended decoder), which almost
-    # always produces a full sentence.  If the user already asked for nucleus we
-    # retry with a different random seed to encourage variation.
-    word_count = len(caption.split())
-    if word_count <= 3:
-        retry_seed = (seed + 7) if seed is not None else None
-        if retry_seed is not None:
-            np.random.seed(retry_seed)
-        fallback_caption = nucleus_decode(
-            model, feature, tokenizer, p=min(p + 0.05, 0.97), temperature=max(temperature + 0.15, 1.0)
+    caption = _clean_repeated_words(strip_sequence_tokens(caption), max_consecutive=1)
+    issues = caption_quality_issues(caption)
+    if issues and decoder != "beam":
+        caption = beam_search_decode(model, feature, tokenizer, beam_size=beam_size)
+        caption = _clean_repeated_words(strip_sequence_tokens(caption), max_consecutive=1)
+        issues = caption_quality_issues(caption)
+    if issues and decoder == "beam":
+        caption = greedy_decode(model, feature, tokenizer)
+        caption = _clean_repeated_words(strip_sequence_tokens(caption), max_consecutive=1)
+        issues = caption_quality_issues(caption)
+    if issues:
+        raise RuntimeError(
+            "The trained caption model produced unusable text ("
+            + "; ".join(issues)
+            + "). The model needs evaluation or retraining; no template caption was substituted."
         )
-        fallback_caption = strip_sequence_tokens(fallback_caption)
-        fallback_caption = _clean_repeated_words(fallback_caption, max_consecutive=0)
-        if len(fallback_caption.split()) > word_count:
-            caption = fallback_caption
 
     if seed is None:
         np.random.seed()  # reset global RNG to non-deterministic state

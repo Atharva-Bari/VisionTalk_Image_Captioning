@@ -73,12 +73,16 @@ MAX_CAPTION_LENGTH = None  # computed from training captions
 MAX_VOCAB_SIZE = None  # None = keep all training words; set e.g. 10000 to cap
 
 # --- Image / CNN (VGG16 per internship Week 1 requirement) ---
+# Using the pre-classifier FC layers (fc1-fc2 output, 4096-dim) instead of
+# 512-dim GAP, because GAP + ReLU Dense caused dead-ReLU collapse where the
+# image path projected to all zeros and the LSTM ignored images entirely.
 CNN_MODEL_NAME = "VGG16"
 CNN_WEIGHTS = "imagenet"
-CNN_POOLING = None
+CNN_POOLING = "fc"   # "fc" = use VGG16 fc2 output (4096-dim), NOT global avg pool
 IMAGE_SIZE = (224, 224)
-FEATURE_VECTOR_DIM = 4096  # VGG16 fc2 (penultimate) layer output (include_top=True)
+FEATURE_VECTOR_DIM = 4096  # VGG16 fc2 output layer size (ImageNet pre-trained)
 FEATURE_BATCH_SIZE = 16
+NORM_VGG16_FEATURES = "l2"  # "l2" or "zscore" - normalize features so the FC projection is stable
 
 # --- Training ---
 # 20–50 epochs required by internship final training phase.
