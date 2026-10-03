@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import importlib
 from pathlib import Path
 
 import streamlit as st
@@ -9,6 +10,18 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# Streamlit Cloud may rerun a changed app inside an existing Python process.
+# Refresh the project modules so a rerun cannot pair new UI code with a stale
+# cached inference or feature-extraction module.
+import src.config as _config_module
+import src.feature_extraction as _feature_extraction_module
+import src.inference as _inference_module
+
+importlib.invalidate_caches()
+importlib.reload(_config_module)
+importlib.reload(_feature_extraction_module)
+importlib.reload(_inference_module)
 
 from src.config import (
     CNN_MODEL_NAME,
