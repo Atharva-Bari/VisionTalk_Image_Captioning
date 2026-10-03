@@ -10,7 +10,11 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.inference import _pick_next_id_without_repeat, caption_quality_issues
+from src.inference import (
+    _normalize_feature_for_model,
+    _pick_next_id_without_repeat,
+    caption_quality_issues,
+)
 from src.feature_extraction import (
     _ensure_metadata_compatible,
     _normalize_features,
@@ -46,6 +50,8 @@ def test_vgg_feature_normalization_matches_checkpoint_input_contract() -> None:
     assert np.allclose(normalized[0], [0.6, 0.8])
     assert np.allclose(np.linalg.norm(normalized[0]), 1.0)
     assert np.allclose(normalized[1], [0.0, 0.0])
+    model_input = _normalize_feature_for_model(np.asarray([3.0, 4.0], dtype=np.float32))
+    assert np.allclose(model_input, [0.6, 0.8])
 
 
 def test_stale_feature_cache_metadata_is_rejected() -> None:

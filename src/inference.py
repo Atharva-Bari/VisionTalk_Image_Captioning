@@ -89,6 +89,15 @@ def _special_ids(tokenizer: dict) -> tuple[int, int]:
     return start_id, end_id
 
 
+def _normalize_feature_for_model(image_feature: np.ndarray) -> np.ndarray:
+    """Apply the checkpoint's trained L2 feature normalization at inference."""
+    feature = np.asarray(image_feature, dtype=np.float32).reshape(-1)
+    norm = float(np.linalg.norm(feature))
+    if norm > 1e-8:
+        feature = feature / norm
+    return feature
+
+
 def _suppress_recent_tokens(probs, seq, block_size: int = 3, penalty: float = 1e-8) -> np.ndarray:
     """Penalise (soft-ban) any token that was output in the last `block_size` steps.
 
@@ -461,10 +470,12 @@ def generate_caption(
     expected_dim = int(model.inputs[0].shape[-1] or FEATURE_VECTOR_DIM)
     if encoder is None:
         encoder = build_encoder_for_dim(expected_dim)
-    feature = extract_single_image_feature(path, encoder=encoder)
+    feature = _normalize_feature_for_model(extract_single_image_feature(path, encoder=encoder))
     if feature.shape[-1] != expected_dim:
         rebuilt_encoder = build_encoder_for_dim(expected_dim)
-        feature = extract_single_image_feature(path, encoder=rebuilt_encoder)
+        feature = _normalize_feature_for_model(
+            extract_single_image_feature(path, encoder=rebuilt_encoder)
+        )
         if feature.shape[-1] != expected_dim:
             raise ValueError(
                 f"CNN feature size {feature.shape[-1]} does not match model input {expected_dim}. "

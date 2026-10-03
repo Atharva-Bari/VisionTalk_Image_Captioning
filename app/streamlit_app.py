@@ -19,7 +19,7 @@ from src.config import (
     IMAGE_SIZE,
     TOKENIZER_PATH,
 )
-from src.feature_extraction import NORM_VGG16_FEATURES, build_encoder_for_dim
+from src.feature_extraction import build_encoder_for_dim
 from src.inference import INFERENCE_CODE_VERSION, generate_caption, resolve_model_path
 from src.tokenizer_utils import load_tokenizer
 
@@ -77,7 +77,9 @@ with st.expander("Model Diagnostics"):
         "model text input length": int(model.inputs[1].shape[-1]),
         "vocabulary size": int(tokenizer["vocab_size"]),
         "configured feature dimension": FEATURE_VECTOR_DIM,
-        "feature normalization": NORM_VGG16_FEATURES,
+        "feature normalization": getattr(
+            sys.modules.get("src.config"), "NORM_VGG16_FEATURES", "l2"
+        ),
         "CNN encoder": f"{CNN_MODEL_NAME} ({CNN_POOLING}), image size={IMAGE_SIZE}",
         "inference function": "src.inference.generate_caption",
         "decoder": "beam search (quality-gated; greedy retry)",
