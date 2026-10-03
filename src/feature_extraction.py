@@ -23,13 +23,16 @@ from src.config import (
     FEATURES_VECTOR_DIR,
     IMAGE_SIZE,
     IMAGE_EXTENSIONS,
-    NORM_VGG16_FEATURES,
     ensure_project_directories,
     resolve_images_dir,
 )
+from src import config as _config
 from src.data_loader import list_image_filenames
 
 EXTRACTOR_PREPROCESS = "tensorflow.keras.applications.vgg16.preprocess_input"
+# Keep inference compatible with the pre-normalization config while preserving
+# the trained checkpoint's L2 feature contract in current deployments.
+NORM_VGG16_FEATURES = getattr(_config, "NORM_VGG16_FEATURES", "l2")
 
 
 def vector_cache_path(image_name: str, vector_dir: Path | None = None) -> Path:

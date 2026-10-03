@@ -17,10 +17,9 @@ from src.config import (
     FINAL_MODEL_PATH,
     IMAGE_EXTENSIONS,
     IMAGE_SIZE,
-    NORM_VGG16_FEATURES,
     TOKENIZER_PATH,
 )
-from src.feature_extraction import build_encoder_for_dim
+from src.feature_extraction import NORM_VGG16_FEATURES, build_encoder_for_dim
 from src.inference import INFERENCE_CODE_VERSION, generate_caption, resolve_model_path
 from src.tokenizer_utils import load_tokenizer
 
