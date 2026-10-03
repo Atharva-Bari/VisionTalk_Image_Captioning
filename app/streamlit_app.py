@@ -96,6 +96,11 @@ with st.expander("Model Diagnostics"):
         "tokenizer file": str(TOKENIZER_PATH),
         "model image input shape": expected_shape,
         "encoder feature shape": tuple(int(dim) for dim in encoder.output_shape[1:]),
+        "visual grounding": (
+            "per-word spatial attention over 49 VGG16 regions"
+            if len(expected_shape) == 2
+            else "legacy global VGG16 feature vector"
+        ),
         "model text input length": int(model.inputs[1].shape[-1]),
         "vocabulary size": int(tokenizer["vocab_size"]),
         "configured legacy feature dimension": FEATURE_VECTOR_DIM,
